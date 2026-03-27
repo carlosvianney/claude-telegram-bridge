@@ -1,6 +1,6 @@
 {
   "name": "claude-telegram-bridge",
-  "version": "3.1.0",
+  "version": "3.2.0",
   "description": "Two-way Telegram chat bridge for Claude Code. Send/receive text, photos, videos, voice messages, files, inline buttons. Includes Whisper audio transcription and video keyframe extraction.",
   "author": "OCS CommTech LLC <contact@ocscommtech.com>",
   "license": "MIT",

@@ -6,7 +6,7 @@ import TelegramBot from "node-telegram-bot-api";
 import { z } from "zod";
 import * as fs from "fs";
 import * as path from "path";
-import { execSync } from "child_process";
+import { execFileSync } from "child_process";
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const CHAT_ID = process.env.CHAT_ID;
@@ -54,9 +54,28 @@ let lastSentMessageId: number | null = null;
 // --- Bot ---
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
-bot.on("polling_error", () => {});
+bot.on("polling_error", (err) => {
+  const msg = err instanceof Error ? err.message : String(err);
+  // Log to stderr so MCP stdio isn't polluted
+  process.stderr.write(`[telegram-mcp] polling_error: ${msg}\n`);
+  // Also notify MCP client if ready
+  if (mcpReady) {
+    server.sendLoggingMessage({
+      level: "error",
+      logger: "telegram",
+      data: `Polling error: ${msg}. Messages may be delayed or lost.`,
+    }).catch(() => {});
+  }
+});
 
 // --- Helpers ---
+
+/** Generate a unique filename with timestamp + random suffix to avoid collisions */
+function uniqueName(prefix: string, ext: string): string {
+  const ts = Date.now();
+  const rand = Math.random().toString(36).slice(2, 8);
+  return `${prefix}_${ts}_${rand}${ext}`;
+}
 
 async function downloadFile(fileId: string, suggestedName?: string): Promise<{ localPath: string; fileName: string }> {
   const file = await bot.getFile(fileId);
@@ -89,9 +108,35 @@ function formatForTelegram(text: string): string {
     return `<pre><code${cls}>${escapeHtml(code.trimEnd())}</code></pre>`;
   });
   formatted = formatted.replace(/`([^`]+)`/g, (_match, code) => `<code>${escapeHtml(code)}</code>`);
-  formatted = formatted.replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>");
-  formatted = formatted.replace(/(?<![<\/\w])\*([^*]+)\*(?![>])/g, "<i>$1</i>");
+  formatted = formatted.replace(/\*\*([^*]+)\*\*/g, (_match, content) => `<b>${escapeHtml(content)}</b>`);
+  formatted = formatted.replace(/(?<![<\/\w])\*([^*]+)\*(?![>])/g, (_match, content) => `<i>${escapeHtml(content)}</i>`);
   return formatted;
+}
+
+/** Smart chunk that avoids splitting inside HTML tags */
+function smartChunk(text: string, maxLen: number): string[] {
+  if (text.length <= maxLen) return [text];
+  const chunks: string[] = [];
+  let remaining = text;
+  while (remaining.length > 0) {
+    if (remaining.length <= maxLen) {
+      chunks.push(remaining);
+      break;
+    }
+    // Try to split at a newline near the limit
+    let splitAt = remaining.lastIndexOf("\n", maxLen);
+    if (splitAt < maxLen * 0.5) {
+      // No good newline, try space
+      splitAt = remaining.lastIndexOf(" ", maxLen);
+    }
+    if (splitAt < maxLen * 0.3) {
+      // No good split point, force at limit
+      splitAt = maxLen;
+    }
+    chunks.push(remaining.slice(0, splitAt));
+    remaining = remaining.slice(splitAt).trimStart();
+  }
+  return chunks;
 }
 
 const IMAGE_EXTS = [".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"];
@@ -107,25 +152,26 @@ async function processMessage(msg: TelegramBot.Message): Promise<IncomingMessage
 
   if (msg.photo && msg.photo.length > 0) {
     const largest = msg.photo[msg.photo.length - 1];
-    const { localPath, fileName } = await downloadFile(largest.file_id, `photo_${date}.jpg`);
+    const { localPath, fileName } = await downloadFile(largest.file_id, uniqueName("photo", ".jpg"));
     return { text: caption || "[Photo]", from, date, type: "photo", filePath: localPath, fileName, caption, fileSize: largest.file_size };
   }
   if (msg.video) {
-    const vidName = (msg.video as any).file_name || `video_${date}.mp4`;
+    const vidName = (msg.video as any).file_name || uniqueName("video", ".mp4");
     const { localPath, fileName } = await downloadFile(msg.video.file_id, vidName);
     return { text: caption || "[Video]", from, date, type: "video", filePath: localPath, fileName, caption, mimeType: msg.video.mime_type, fileSize: msg.video.file_size };
   }
   if (msg.voice) {
-    const { localPath, fileName } = await downloadFile(msg.voice.file_id, `voice_${date}.ogg`);
+    const { localPath, fileName } = await downloadFile(msg.voice.file_id, uniqueName("voice", ".ogg"));
     return { text: "[Voice message]", from, date, type: "voice", filePath: localPath, fileName, mimeType: msg.voice.mime_type, fileSize: msg.voice.file_size };
   }
   if (msg.audio) {
-    const audioName = (msg.audio as any).file_name || `audio_${date}.mp3`;
+    const audioName = (msg.audio as any).file_name || uniqueName("audio", ".mp3");
     const { localPath, fileName } = await downloadFile(msg.audio.file_id, audioName);
     return { text: caption || `[Audio: ${msg.audio.title || fileName}]`, from, date, type: "audio", filePath: localPath, fileName, caption, mimeType: msg.audio.mime_type, fileSize: msg.audio.file_size };
   }
   if (msg.document) {
-    const { localPath, fileName } = await downloadFile(msg.document.file_id, msg.document.file_name || `doc_${date}`);
+    const docName = msg.document.file_name || uniqueName("doc", path.extname(msg.document.file_name || "") || "");
+    const { localPath, fileName } = await downloadFile(msg.document.file_id, docName);
     return { text: caption || `[Document: ${fileName}]`, from, date, type: "document", filePath: localPath, fileName, caption, mimeType: msg.document.mime_type, fileSize: msg.document.file_size };
   }
   if (msg.sticker) {
@@ -211,7 +257,7 @@ bot.on("callback_query", async (query) => {
 
 // --- MCP Server ---
 
-const server = new McpServer({ name: "telegram-chat-mcp", version: "3.1.0" });
+const server = new McpServer({ name: "telegram-chat-mcp", version: "3.2.0" });
 
 const STOP_WORDS = ["/done", "/stop", "/back", "/desk"];
 
@@ -231,8 +277,7 @@ server.tool(
     if (buttons) {
       opts.reply_markup = { inline_keyboard: buttons.map(row => row.map(btn => ({ text: btn.text, callback_data: btn.data }))) };
     }
-    const chunks: string[] = [];
-    for (let i = 0; i < formatted.length; i += 4000) chunks.push(formatted.slice(i, i + 4000));
+    const chunks = smartChunk(formatted, 4000);
 
     let sentMsg: TelegramBot.Message | undefined;
     for (const chunk of chunks) {
@@ -267,7 +312,9 @@ server.tool(
     if (buttons) {
       opts.reply_markup = { inline_keyboard: buttons.map(row => row.map(btn => ({ text: btn.text, callback_data: btn.data }))) } as TelegramBot.InlineKeyboardMarkup;
     }
-    try { await bot.editMessageText(formatted, opts); }
+    // Chunk edit_message too — if over limit, truncate with indicator
+    const truncated = formatted.length > 4096 ? formatted.slice(0, 4080) + "\n…[truncated]" : formatted;
+    try { await bot.editMessageText(truncated, opts); }
     catch { try { await bot.editMessageText(text.slice(0, 4000), { ...opts, parse_mode: undefined }); } catch { return { content: [{ type: "text", text: "Error: Could not edit message." }] }; } }
     return { content: [{ type: "text", text: JSON.stringify({ edited: true, message_id: targetId }) }] };
   }
@@ -328,11 +375,23 @@ server.tool(
 // TOOL: check_messages (non-blocking)
 server.tool(
   "check_messages",
-  "Check for any unread Telegram messages without blocking. Returns all queued messages or empty array.",
+  "Check for any unread Telegram messages and button presses without blocking. Returns all queued messages/callbacks or empty array. Also checks for stop words.",
   {},
   async () => {
     const messages = messageQueue.splice(0);
-    return { content: [{ type: "text", text: JSON.stringify(messages.map(formatMessage)) }] };
+    const callbacks = callbackQueue.splice(0);
+    const results: Record<string, unknown>[] = [];
+
+    for (const msg of messages) {
+      if (msg.type === "text" && STOP_WORDS.includes(msg.text.trim().toLowerCase())) {
+        return { content: [{ type: "text", text: JSON.stringify({ stop: true, codeword: msg.text.trim(), pending: results }) }] };
+      }
+      results.push(formatMessage(msg));
+    }
+    for (const cb of callbacks) {
+      results.push({ button_data: cb.data, from: cb.from, message_id: cb.messageId });
+    }
+    return { content: [{ type: "text", text: JSON.stringify(results) }] };
   }
 );
 
@@ -349,8 +408,8 @@ server.tool(
 
     // Handle confusing extensions (.ts = TypeScript but Telegram thinks MPEG Transport Stream)
     if (CONFUSING_EXTS.includes(ext)) {
-      const safePath = filePath.replace(/\.ts$/, ".txt");
-      const tmpPath = path.join(DOWNLOAD_DIR, path.basename(safePath));
+      const safeName = path.basename(filePath).replace(/\.ts$/i, ".txt");
+      const tmpPath = path.join(DOWNLOAD_DIR, safeName);
       fs.copyFileSync(filePath, tmpPath);
       await bot.sendDocument(chatId, tmpPath, { caption: caption ? `${caption} (renamed .ts → .txt)` : `${path.basename(filePath)} (renamed .ts → .txt)` });
       cleanupFile(tmpPath);
@@ -400,7 +459,7 @@ server.tool(
       let audioPath = filePath;
       if (filePath.endsWith(".ogg") || filePath.endsWith(".oga")) {
         audioPath = filePath.replace(/\.[^.]+$/, ".mp3");
-        execSync(`ffmpeg -y -i "${filePath}" -acodec libmp3lame -q:a 2 "${audioPath}"`, { timeout: 60000, stdio: "pipe" });
+        execFileSync("ffmpeg", ["-y", "-i", filePath, "-acodec", "libmp3lame", "-q:a", "2", audioPath], { timeout: 60000, stdio: "pipe" });
       }
       const transcript = await transcribeAudio(audioPath);
       // Auto-cleanup
@@ -434,7 +493,7 @@ server.tool(
     // Transcribe audio
     try {
       audioPath = filePath.replace(/\.[^.]+$/, ".mp3");
-      execSync(`ffmpeg -y -i "${filePath}" -vn -acodec libmp3lame -q:a 2 "${audioPath}"`, { timeout: 120000, stdio: "pipe" });
+      execFileSync("ffmpeg", ["-y", "-i", filePath, "-vn", "-acodec", "libmp3lame", "-q:a", "2", audioPath], { timeout: 120000, stdio: "pipe" });
       results.transcript = await transcribeAudio(audioPath);
     } catch (err: any) {
       results.transcript = `[Audio extraction/transcription failed: ${err.message}]`;
@@ -449,12 +508,12 @@ server.tool(
 
         let duration = 10;
         try {
-          const probe = execSync(`ffprobe -v error -show_entries format=duration -of csv=p=0 "${filePath}"`, { timeout: 30000, stdio: "pipe" }).toString().trim();
+          const probe = execFileSync("ffprobe", ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", filePath], { timeout: 30000, stdio: "pipe" }).toString().trim();
           duration = parseFloat(probe) || 10;
         } catch {}
 
         const interval = Math.max(duration / frameLimit, 2);
-        execSync(`ffmpeg -y -i "${filePath}" -vf "fps=1/${interval}" -frames:v ${frameLimit} "${framesDir}/frame_%03d.jpg"`, { timeout: 120000, stdio: "pipe" });
+        execFileSync("ffmpeg", ["-y", "-i", filePath, "-vf", `fps=1/${interval}`, "-frames:v", String(frameLimit), `${framesDir}/frame_%03d.jpg`], { timeout: 120000, stdio: "pipe" });
 
         const frameFiles = fs.readdirSync(framesDir).sort().filter(f => f.endsWith(".jpg"));
         results.keyframeCount = frameFiles.length;
