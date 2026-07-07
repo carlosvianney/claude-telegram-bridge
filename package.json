@@ -1,7 +1,7 @@
 {
   "name": "claude-telegram-bridge",
-  "version": "3.2.0",
-  "description": "Two-way Telegram chat bridge for Claude Code. Send/receive text, photos, videos, voice messages, files, inline buttons. Includes Whisper audio transcription and video keyframe extraction.",
+  "version": "3.4.0",
+  "description": "Two-way Telegram chat bridge for Claude Code. Send/receive text, photos, videos, voice messages, files, inline buttons. Includes Whisper audio transcription and video keyframe extraction. Built on grammY with automatic rate-limit retry and reliable Markdown→HTML formatting.",
   "author": "OCS CommTech LLC <contact@ocscommtech.com>",
   "license": "MIT",
   "repository": {
@@ -29,12 +29,13 @@
     "dev": "tsc --watch"
   },
   "dependencies": {
+    "@grammyjs/auto-retry": "^2.0.2",
     "@modelcontextprotocol/sdk": "^1.12.1",
-    "node-telegram-bot-api": "^0.66.0"
+    "grammy": "^1.30.0",
+    "zod": "^3.23.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
-    "@types/node-telegram-bot-api": "^0.64.0",
     "typescript": "^5.4.0"
   },
   "engines": {

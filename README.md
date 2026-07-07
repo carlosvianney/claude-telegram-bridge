@@ -8,8 +8,10 @@ The official Claude Code Channels (Telegram plugin) only works in the CLI. This 
 
 **Messaging**
 - Send and receive text with markdown formatting (code blocks, bold, italic)
-- Auto-chunking for long messages (4000 char limit per Telegram message)
-- HTML parse mode with plain-text fallback
+- Reliable Markdown→HTML pipeline: escape-once, placeholder-protected code spans — backticks and `<`/`&` characters can no longer break formatting (fixed in v3.4)
+- Safe auto-chunking for long messages — splits at logical boundaries, never inside a code block or HTML tag
+- HTML parse mode with readable plain-text fallback
+- Automatic retry with backoff on Telegram rate limits (429) and transient network errors
 
 **Media**
 - Receive photos, videos, voice messages, audio files, documents, stickers, locations, contacts
@@ -26,13 +28,14 @@ The official Claude Code Channels (Telegram plugin) only works in the CLI. This 
 **Audio/Video Processing** *(optional — requires FFmpeg + OpenAI API key)*
 - Transcribe voice messages and audio files via OpenAI Whisper
 - Process videos: extract audio transcript + keyframes as images Claude can see
-- Auto-cleanup of temporary files after processing
+- Auto-cleanup of temporary files; pass `keepFile: true` to keep sources (files outside the download dir are never deleted)
 
 **Session Management**
-- `wait_for_message` blocks until user sends anything (text, media, or button press)
+- `wait_for_message` blocks until user sends anything (text, media, or button press) — optional `timeout_seconds`, clean abort handling (no zombie listeners)
 - Stop codewords: `/done`, `/stop`, `/back`, `/desk` — cleanly end the listening loop
 - `check_messages` for non-blocking queue reads
 - MCP logging notifications when messages arrive while not listening
+- Structured error results (`isError`) on every tool; file-size guards (20 MB download / 50 MB upload limits reported clearly)
 
 ## Tools
 
@@ -159,7 +162,13 @@ The bot runs inside the MCP server process. No separate service, no webhook setu
 - **One chat only** — the `CHAT_ID` env var locks it to a single conversation
 - **VS Code keyboard blocked** while `wait_for_message` is active (you're on Telegram instead)
 - **No push notifications** — Claude can't initiate a turn from Telegram. You text first, Claude responds.
-- **Telegram file size limit** — 50MB for downloads, 10MB for photos
+- **Telegram file size limit** — bots can download files up to 20 MB and upload up to 50 MB
+
+## Changelog
+
+- **v3.4.0** — Engine migration to [grammY](https://grammy.dev) (typed Bot API, no deprecated dependencies) with automatic 429/network retry. Formatter rewritten: the long-standing backtick/`<code>` rendering bug is fixed at the root (escape-once pipeline, placeholder-protected code spans, chunk-before-format so code blocks never split). `wait_for_message` gains `timeout_seconds` + abort cleanup. `transcribe_audio`/`process_video` gain `keepFile` and no longer delete files outside the download dir. Structured `isError` results, download/upload size guards, sandboxed cleanup paths, graceful startup failure.
+- **v3.2.0** — Fix silent polling errors, shell injection, message handling bugs.
+- **v3.1** — Full two-way Telegram MCP for Claude Code.
 
 ## License
 
