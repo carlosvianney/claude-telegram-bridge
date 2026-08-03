@@ -78,7 +78,7 @@ function clearResolvers() {
 // --- MCP server (declared early so the bot handlers can log through it) ---
 
 const server = new McpServer(
-  { name: "telegram-chat-mcp", version: "3.5.1" },
+  { name: "telegram-chat-mcp", version: "3.6.0" },
   { capabilities: { logging: {} } }
 );
 
@@ -362,7 +362,11 @@ bot.on("callback_query", async (ctx) => {
   };
   await ctx.answerCallbackQuery().catch(() => {});
   if (callbackResolver) { const resolve = callbackResolver; clearResolvers(); resolve(cb); }
-  else callbackQueue.push(cb);
+  else {
+    // Same bound as messageQueue — button taps must not grow without limit either.
+    if (callbackQueue.length >= MAX_QUEUED) { callbackQueue.shift(); droppedCount++; }
+    callbackQueue.push(cb);
+  }
 });
 
 // --- Tools ---
@@ -471,6 +475,8 @@ server.tool(
     timeout_seconds: z.number().optional().describe("Optional: give up after this many seconds and return {timeout:true}. Omit to wait indefinitely."),
   },
   async ({ timeout_seconds }, extra) => {
+    const dead = pollingFailure();
+    if (dead) return dead;
     if (callbackQueue.length > 0) {
       const cb = callbackQueue.shift()!;
       return ok({ button_data: cb.data, from: cb.from, message_id: cb.messageId });
@@ -561,6 +567,8 @@ server.tool(
   "Check for any unread Telegram messages and button presses without blocking. Returns all queued messages/callbacks or empty array. Also checks for stop words.",
   {},
   async () => {
+    const dead = pollingFailure();
+    if (dead) return dead;
     const messages = messageQueue.splice(0);
     const callbacks = callbackQueue.splice(0);
     const results: Record<string, unknown>[] = [];
@@ -763,21 +771,151 @@ server.tool(
   }
 );
 
+// --- Single-instance lifecycle ---
+
+/**
+ * Telegram allows exactly ONE getUpdates consumer per bot token. A previous
+ * session that was SIGKILLed leaves this process alive as an orphan holding
+ * the slot, so every later session gets 409 Conflict and silently receives
+ * nothing. The pid file lets a new instance reclaim the slot from its own
+ * stale predecessor.
+ */
+const PID_FILE = path.join(DOWNLOAD_DIR, "telegram-mcp.pid");
+const SELF_SCRIPT = process.argv[1] || "telegram-chat-mcp";
+
+interface PidRecord { pid: number; script: string }
+
+function readPidFile(): PidRecord | null {
+  try {
+    const rec = JSON.parse(fs.readFileSync(PID_FILE, "utf8")) as PidRecord;
+    return typeof rec?.pid === "number" && rec.pid > 1 ? rec : null;
+  } catch { return null; }
+}
+
+/**
+ * True only if `pid` is alive AND is another instance of THIS server.
+ * PIDs are recycled, so liveness alone is never sufficient — SIGTERMing on
+ * that basis would kill whatever unrelated process inherited the number.
+ * Identity is verified against /proc; if that is unreadable we return false
+ * and therefore never signal anything.
+ */
+function isLiveSibling(pid: number, script: string): boolean {
+  if (!Number.isInteger(pid) || pid <= 1 || pid === process.pid) return false;
+  try {
+    const cmdline = fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").replace(/\0/g, " ");
+    return cmdline.includes(script);
+  } catch { return false; }
+}
+
+function writePidFile(): void {
+  const tmp = `${PID_FILE}.${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify({ pid: process.pid, script: SELF_SCRIPT }));
+  fs.renameSync(tmp, PID_FILE); // atomic replace
+}
+
+/** Reclaim the polling slot from a verified stale sibling, then claim the file. */
+function claimPollingSlot(): void {
+  const rec = readPidFile();
+  if (rec && isLiveSibling(rec.pid, rec.script)) {
+    log("warning", `Replacing stale telegram-mcp poller pid=${rec.pid}`);
+    try { process.kill(rec.pid, "SIGTERM"); } catch {}
+  }
+  writePidFile();
+}
+
+let shuttingDown = false;
+function shutdown(code = 0): void {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  const rec = readPidFile();
+  if (rec?.pid === process.pid) { try { fs.rmSync(PID_FILE); } catch {} }
+  // bot.stop() ends the poll loop, but the in-flight getUpdates may take up to
+  // its long-poll timeout to return. Force the exit rather than linger.
+  setTimeout(() => process.exit(code), 2000);
+  void Promise.resolve(bot.stop()).catch(() => {}).finally(() => process.exit(code));
+}
+
+// --- Polling supervisor ---
+
+type PollingState = "starting" | "running" | "stopped";
+let pollingState: PollingState = "starting";
+let pollingError = "";
+const POLL_MAX_ATTEMPTS = 8;
+
+/**
+ * The single guard that makes a dead poller VISIBLE. Previously a dead loop
+ * was indistinguishable from silence: wait_for_message returned a clean
+ * timeout and check_messages an empty array, forever.
+ */
+function pollingFailure(): { content: ToolContent; isError: true } | null {
+  return pollingState === "stopped"
+    ? fail(`Telegram polling is not running (${pollingError}). Incoming messages are NOT being received. The server will retry, then exit so it can be restarted.`)
+    : null;
+}
+
+async function runPolling(): Promise<void> {
+  for (let attempt = 1; attempt <= POLL_MAX_ATTEMPTS; attempt++) {
+    try {
+      await bot.start({
+        allowed_updates: ["message", "callback_query"],
+        onStart: () => {
+          pollingState = "running";
+          pollingError = "";
+          process.stderr.write("[telegram-mcp] polling started (v3.6.0, grammY)\n");
+        },
+      });
+      return; // resolved only via bot.stop()
+    } catch (err) {
+      const ge = err instanceof GrammyError ? err : null;
+      pollingState = "stopped";
+      pollingError = ge ? `${ge.error_code}: ${ge.description}` : String(err instanceof Error ? err.message : err);
+
+      // Bad token: retrying cannot help.
+      if (ge?.error_code === 401) {
+        log("error", `Telegram rejected the bot token (401). Exiting.`);
+        return shutdown(1);
+      }
+      // Another *verified* instance legitimately owns the token — we are the
+      // duplicate, so step aside instead of fighting it.
+      const rec = readPidFile();
+      if (ge?.error_code === 409 && rec && isLiveSibling(rec.pid, rec.script)) {
+        log("error", `Another telegram-mcp (pid=${rec.pid}) owns this bot token. Exiting.`);
+        return shutdown(1);
+      }
+      if (attempt === POLL_MAX_ATTEMPTS) {
+        log("error", `Telegram polling failed ${attempt}x (${pollingError}). Exiting so the MCP host can restart it.`);
+        return shutdown(1);
+      }
+      const delay = Math.min(500 * 2 ** (attempt - 1), 10000);
+      log("warning", `Telegram polling error (${pollingError}); retry ${attempt}/${POLL_MAX_ATTEMPTS} in ${delay}ms.`);
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+}
+
 // --- Start ---
 
 async function main() {
+  claimPollingSlot();
+
   const transport = new StdioServerTransport();
   await server.connect(transport);
   mcpReady = true;
-  // Long polling starts after MCP is connected; runs until process exit.
-  // A failed start (bad token, network down) must not kill the MCP server —
-  // tools then return errors, and the failure is visible instead of fatal.
-  bot.start({
-    allowed_updates: ["message", "callback_query"],
-    onStart: () => { process.stderr.write("[telegram-mcp] polling started (v3.5.1, grammY)\n"); },
-  }).catch((err) => {
-    log("error", `Telegram polling failed to start: ${err instanceof Error ? err.message : String(err)}`);
-  });
+
+  // Losing the MCP host must not leave an orphan holding the token.
+  process.stdin.on("end", () => shutdown(0));
+  process.stdin.on("close", () => shutdown(0));
+  for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"] as const) process.on(sig, () => shutdown(0));
+
+  // Reparenting emits no event, and stdin EOF is not reliably delivered when
+  // the parent chain dies abruptly — observed on this machine as MCP orphans
+  // surviving for weeks with PPID 1. Polling for it is the only detection.
+  const bootPpid = process.ppid;
+  setInterval(() => {
+    if (process.ppid !== bootPpid || process.stdin.destroyed || process.stdin.readableEnded) shutdown(0);
+  }, 5000).unref();
+
+  void runPolling();
 }
 
 main().catch((err) => { console.error("Fatal:", err); process.exit(1); });

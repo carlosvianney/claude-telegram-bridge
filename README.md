@@ -179,19 +179,19 @@ could escape the download directory and overwrite arbitrary files. Details in
 
 ## Known Issues
 
-The honest list of what still breaks — including a silent failure mode where
-the bridge stops receiving and never recovers — is in
+The honest list of what still breaks is in
 **[KNOWN-ISSUES.md](KNOWN-ISSUES.md)**.
 
-Short version: if the bridge goes quiet, restart the MCP server and check for
-stray processes (`ps aux | grep telegram`). A duplicate consumer of the same
-bot token kills polling permanently, and today that looks exactly like nobody
-texting you.
+Short version: as of v3.6.0 the bridge no longer fails silently — if polling
+dies, the tools say so instead of returning empty results forever. If they
+report "Not connected", the server exited on purpose so it could be restarted;
+reload the session. Check for stray processes with `ps aux | grep telegram`.
 
 ## Changelog
 
 Full history in **[CHANGELOG.md](CHANGELOG.md)**.
 
+- **v3.6.0** — The bridge can no longer die quietly. A dead poller (409 duplicate consumer, or 401 rejected token — a second silent-death vector found this round) used to return clean timeouts forever with no recovery; it now surfaces an explicit error through the tools, retries with backoff, and exits so the host can restart it. Adds pid-file single-instance with verified takeover (never signals a process it cannot positively identify), orphan self-exit, and a bound on the callback queue.
 - **v3.5.1** — Fixed a **critical** crash: a code fence with a very long language token sent `splitRaw` into an infinite loop and killed the process (taking the whole bridge down) — reachable through any content the assistant echoes. Also: `send_file` on a `.ts` file could delete a same-named received attachment; `messageQueue` is now bounded at 500 with the drop count surfaced; `process_video` frames are capped and share the 4 MB inline budget.
 - **v3.5.0** — Fixed: one slow media download blocked every other message (downloads moved off the update loop — no timeouts added). Security: arbitrary file write via `file_name` (path traversal), and unbounded download despite the declared 20 MB limit. Also: messages arriving during a client abort are no longer swallowed, and failed downloads no longer carry stale file metadata.
 - **v3.4.0** — Engine migration to [grammY](https://grammy.dev) (typed Bot API, no deprecated dependencies) with automatic 429/network retry. Formatter rewritten: the long-standing backtick/`<code>` rendering bug is fixed at the root (escape-once pipeline, placeholder-protected code spans, chunk-before-format so code blocks never split). `wait_for_message` gains `timeout_seconds` + abort cleanup. `transcribe_audio`/`process_video` gain `keepFile` and no longer delete files outside the download dir. Structured `isError` results, download/upload size guards, sandboxed cleanup paths, graceful startup failure.

@@ -8,58 +8,34 @@ Ordered by how much damage they actually cause in daily use.
 
 ---
 
-## 1. A dead poller is invisible — and never recovers
+## 1. A crashed poller may need a session reload
 
-**Severity: high. Not fixed. This is the next thing to fix.**
+**Severity: medium. Much improved in v3.6.0 — read this if the bridge goes
+quiet.**
 
-Telegram's Bot API allows exactly one consumer of `getUpdates` per bot token.
-If a second consumer starts polling the same token, Telegram answers with
-HTTP 409 Conflict. grammY rethrows on 409 rather than retrying, which
-terminates the poll loop. This server catches that and logs a single line —
-then keeps running.
+The old behaviour is gone: a dead poller used to return clean timeouts forever
+with no recovery and no visible evidence. It now retries with backoff, surfaces
+an explicit error through `wait_for_message` and `check_messages`, and exits so
+the host can restart it. Duplicate instances resolve themselves, and orphaned
+processes self-terminate.
 
-The result is the worst possible failure shape:
+**What is still unconfirmed:** whether the MCP host auto-restarts a crashed
+stdio server mid-session. If it does not, the process exits and the bridge is
+down — tools return "Not connected" — until the session reloads.
 
-| | What actually happens |
-|---|---|
-| `wait_for_message` | returns a clean `{"timeout":true}` — forever |
-| `check_messages` | returns `[]` — forever |
-| Process | still alive, tools still respond |
-| Recovery | never, even after the conflicting consumer goes away |
-| Evidence | one line on stderr |
+That is a deliberate trade. A loud failure you can see and act on beats a
+silent one you cannot, and silent message loss was the original complaint.
 
-**From the caller's side, a dead bridge is indistinguishable from nobody
-texting you.** Messages sent during this window are consumed and acknowledged
-by whichever consumer won the race, so they are not merely delayed — they are
-gone.
-
-Reproduced in the harness (`G2.1`–`G2.4`): healthy delivery, then a 409, then
-clean timeouts forever with no self-heal after the conflict clears.
-
-Made worse by two things:
-
-- **No single-instance protection.** There is no pid file and no takeover of a
-  stale holder. Nothing stops two copies of this server from running.
-- **Orphaned MCP processes survive.** On the development machine, unrelated MCP
-  server processes from *weeks* earlier were still running, reparented to init.
-  An orphan of this server would sit there eating messages into a queue no
-  live session can reach.
-
-**Planned fix:** adopt the lifecycle pattern the official Claude Code Telegram
-plugin already uses — pid file with stale-holder takeover, parent-pid orphan
-self-exit, and 409 retry with backoff that exits the process (so the MCP host
-restarts it) rather than dying quietly. Additionally, `wait_for_message` and
-`check_messages` should return an explicit error when the bot is not running,
-instead of a clean timeout.
-
-**Workaround today:** if the bridge goes quiet, restart the MCP server. Check
-for stray processes with `ps aux | grep telegram`.
+**If the bridge goes quiet:** you should now get an actual error rather than
+silence. If tools report "Not connected", reload the session. Check for stray
+processes with `ps aux | grep telegram`.
 
 ---
 
 ## 2. Post-startup logs go nowhere
 
-**Severity: high (it is what makes issue 1 invisible). Not fixed.**
+**Severity: medium. Not fixed.** *(Was high, when it was the only evidence of
+issue 1 — the tool-level error now carries that weight.)*
 
 The server logs to stderr. Claude Code captures MCP stderr only at process
 startup, so every message logged after that is lost. Confirmed empirically:
@@ -67,9 +43,11 @@ the unconditional `polling started` line appears **zero** times across 12 MB of
 captured MCP logs, as does every queue-notification warning that definitely
 fired.
 
-Practical consequence: none of the failures on this page leave a trace anyone
-will ever read, which is why the original diagnosis could not attribute
-historical incidents between "stalled download" and "dead poller."
+Practical consequence: failures leave no trace anyone will ever read. This is
+why the original diagnosis could not attribute historical incidents between
+"stalled download," "dead poller," and "rejected token" — all three produced
+identical silence. Since v3.6.0 the last two surface through the tools, so this
+matters less than it did, but there is still no durable log.
 
 **Planned fix:** write to a real log file under the download directory, with
 rotation.
