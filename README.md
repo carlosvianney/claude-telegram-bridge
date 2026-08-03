@@ -60,7 +60,8 @@ want a self-hosted bridge that works with any auth setup.
 | `wait_for_message` | Block until user sends a message or taps a button |
 | `check_messages` | Non-blocking check for queued messages |
 | `edit_message` | Edit a previously sent message in place |
-| `send_file` | Send any file (auto-detects photo/video/document) |
+| `send_file` | Send a file (auto-detects photo/video/document; refuses credential-shaped paths) |
+| `incoming_feed` | Stream incoming messages to a JSONL file instead of blocking on `wait_for_message` |
 | `react` | Add emoji reaction to a message |
 | `transcribe_audio` | Transcribe audio/voice via Whisper *(optional)* |
 | `process_video` | Extract transcript + keyframes from video *(optional)* |
@@ -165,6 +166,7 @@ Send a video → Claude calls `process_video` → gets:
 | `CHAT_ID` | Yes | Your Telegram chat ID |
 | `OPENAI_API_KEY` | No | For audio transcription and video processing |
 | `DOWNLOAD_DIR` | No | Where to save media files (default: `/tmp/telegram-mcp`) |
+| `SEND_FILE_DENY` | No | Comma-separated glob patterns `send_file` refuses (defaults cover `.env`, `.mcp.json`, SSH keys, `*.pem`, `secrets*`, `credentials*`) |
 | `RETAIN_DOWNLOAD_DAYS` | No | Delete received media older than this many days, once at startup (default `7`, `0` disables) |
 | `ALLOWED_USER_IDS` | No | Comma-separated Telegram user IDs allowed to drive the session. **Set this if `CHAT_ID` is a group** — otherwise every group member can. |
 
@@ -214,6 +216,7 @@ reload the session. Check for stray processes with `ps aux | grep telegram`.
 
 Full history in **[CHANGELOG.md](CHANGELOG.md)**.
 
+- **v3.7.0** — `send_file` now refuses credential-shaped paths (resolved-path matching, so symlinks can't launder a target) and echoes the sent path into the caption so any send is visible. Plus `incoming_feed`: messages append to a JSONL file you watch with `tail -F` instead of blocking a tool call — the editor keyboard stays alive. 49 new pen-test checks, 0 failures.
 - **v3.6.3** — Fixed a regression that made multi-week uptime impossible: the polling retry budget was a *lifetime* allowance rather than per-outage, so a handful of unrelated network blips would exit a perfectly healthy process. Found by a 145-minute, 204k-message soak, which otherwise confirmed no memory leak, no listener accumulation and no orphaned pid files. Also reclaims `DOWNLOAD_DIR` at startup (it grew forever — ~1.3 GB over three weeks at 20 photos/day).
 - **v3.6.2** — Security: `CHAT_ID` was a room gate, not an identity gate — if pointed at a group, any member could drive the session. Adds optional `ALLOWED_USER_IDS` (backwards compatible) plus a startup warning. Also removed a README claim that never worked (MCP logging notifications are not surfaced by Claude Code) and added honest positioning against the official alternatives.
 - **v3.6.1** — Fixed: one malformed update used to discard every queued message alongside it (the queue is drained before processing, so a throw mid-loop lost the whole batch). Plus 44/44 on transport fuzzing — hostile `message_id`s, callback floods, oversized captions and malformed updates all fail soft.

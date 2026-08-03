@@ -108,15 +108,6 @@ Strictly better than the pre-v3.5.0 behaviour, where the same trickle blocked
 oldest with `reader.cancel()` when the cap is hit — bounding fds by
 construction and degrading the evicted message to the existing text fallback.
 
-Downloads now run in the background, so a slow one no longer blocks any
-messages, and the bounded read caps memory and disk at `MAX_DOWNLOAD_BYTES`.
-But nothing watches an idle connection: a server that trickles bytes forever
-keeps a background download alive indefinitely.
-
-Strictly better than the previous behaviour, where the same trickle blocked
-*every* message. Closing it entirely would need a timeout, which this release
-deliberately avoids.
-
 ---
 
 ## 5. Ordering is not guaranteed while a download is stalled
@@ -145,28 +136,29 @@ never observable).
 
 ---
 
-## 7. `send_file` is an unsandboxed read primitive
+## 7. `send_file` guard has two inherent residuals
 
-**Severity: design risk, not a bug. Unchanged by design.**
+**Severity: low. Guard added in v3.7.0; these two remain.**
 
-`send_file` will send any path the caller gives it, and it follows symlinks.
-That is intended — it is an operator-controlled tool on the operator's own
-machine, and restricting it would break ordinary use.
+`send_file` refuses credential-shaped paths (matched on the resolved real path,
+so symlinks and traversal cannot launder a target) and echoes the resolved path
+into the caption so any send is visible in the chat. Two gaps are inherent:
 
-The risk worth naming: **a single prompt-injected `send_file` call exfiltrates
-whatever it names.** A hostile message that persuades the assistant to send
-`.mcp.json`, an `.env`, or a key file puts those credentials in a Telegram
-chat. Nothing in the code prevents this, because nothing in the code can tell
-an intended send from a manipulated one.
+- **Hardlink.** A hardlink *is* the file — `realpath` cannot distinguish it from
+  the original, so a hardlink to a denied file is sendable.
+- **Copy-then-send.** Copying a credential file to an innocuous name and sending
+  the copy still works. This needs a *second* induced tool call rather than one,
+  which is the point of the guard: it converts a one-step silent theft into a
+  multi-step one, with the caption echo making the result visible.
 
-Mitigation is a policy decision rather than a code change — a denylist of
-credential-shaped paths (`.env`, `.mcp.json`, `id_*`, `*.pem`) would cover the
-obvious cases without meaningfully restricting normal use. Not implemented;
-flagged so the risk is at least explicit.
+The guard is a speed bump that produces an alert, not containment. Beyond it,
+`send_file` remains an operator-controlled tool that will send any non-denied
+path the caller names, and follows symlinks by design.
 
-Applies to any MCP server with filesystem reach, not only this one.
+Mitigation beyond this is a policy question, not a code one.
 
 ---
+
 
 ## 8. Running this alongside the official plugin is confusing
 

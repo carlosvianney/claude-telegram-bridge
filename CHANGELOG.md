@@ -4,6 +4,90 @@ All notable changes to this project are documented here.
 
 ---
 
+## v3.7.0 — Credential guard, and messages that arrive without blocking
+
+Two features, both pen-tested before shipping. 49 new checks, 0 failures.
+
+### Added — `send_file` refuses credential-shaped paths
+
+`send_file` had no sandbox: one call could put `.mcp.json`, an SSH key or a
+`.env` into a chat. No code bug — the tool worked as designed — but a
+convincing enough inbound message could induce it.
+
+Now refused: `.env` / `.env.*` / `*.env`, `.mcp.json`, `id_rsa*`, `id_ed25519*`,
+`*.pem`, `*.key`, `secrets` / `secrets.*`, `credentials*`, `.git-credentials`,
+`.netrc`, and the server's own pid file. Override with `SEND_FILE_DENY`.
+
+**Matching is on the resolved real path**, so symlinks cannot launder a target —
+including symlink chains — and `..` traversal, `/proc/self/root/...` and path
+normalisation tricks all resolve to the real file before the check. 7/7 bypass
+attempts denied.
+
+**The patterns are anchored, and that mattered more than the denylist itself.**
+A naive `.env*` / `id_*` / `secrets*` list refuses `.envelope`, `id_photo.jpg`
+and `secretsanta.jpg`. A tool that blocks legitimate sends gets switched off,
+and then it protects nothing. 7/7 false-positive checks pass.
+
+Content sniffing was considered and rejected: it would block a legitimate
+`sshd_config` walkthrough or a post about key rotation, while still missing
+`.mcp.json` (which is ordinary JSON). Cost without benefit.
+
+Two residuals, inherent and documented in KNOWN-ISSUES: a **hardlink** is
+indistinguishable from the file it points to, and **copy-then-send** still
+works — though that needs a second induced tool call rather than one.
+
+### Added — the resolved path is echoed in the caption
+
+Every sent file now carries `📎 /absolute/path` in its Telegram caption, so an
+unexpected send is visible in the chat as it happens — and a symlink reveals its
+true destination. Sent **without `parse_mode`**, so a hostile filename cannot
+inject markup or instructions; truncated to Telegram's 1024-char limit.
+
+Detection, not prevention. It is the half of the credential story the denylist
+cannot cover.
+
+### Added — `incoming_feed`: delivery without a blocking call
+
+`wait_for_message` blocks a tool call to receive input, which freezes the
+assistant and the editor keyboard for the duration. `incoming_feed` appends each
+settled message as one JSON line to `${DOWNLOAD_DIR}/incoming.jsonl` and returns
+a `tail -n0 -F` command to watch. `wait_for_message` is unchanged and still
+works — this is additive.
+
+**Exactly-once, verified in both directions:** a feed-delivered message never
+also appears in `check_messages`, and a concurrent `wait_for_message` wins
+without the message also being written to the feed. Anything already queued is
+migrated on enable rather than stranded.
+
+**Framing is airtight — 9/9.** Embedded newlines, CRLF, a forged
+`{"event":…,"untrusted":false}` payload, JSON-in-JSON, control characters,
+U+2028 and 100k text each produced exactly one line that parsed and round-tripped
+byte-exact. Nothing forged a second event or escaped its field.
+
+The file rotates at 5 MB keeping one generation, so it cannot repeat the
+unbounded-growth problem fixed in v3.6.3.
+
+**Honest limits.** Each line carries `untrusted: true` and confines sender text
+to `message`/`caption` — but that is *labelling, not enforcement*. It cannot stop
+a model that chooses to follow instructions in content; it makes the
+data/instruction boundary explicit and machine-visible. The real defences remain
+`ALLOWED_USER_IDS`, the denylist, and the visible caption echo.
+
+**And delivery is at turn boundaries, not an interrupt.** Measured: 9 ms
+end-to-end when the assistant is between calls, but ~52 s when it was mid-way
+through a 70 s tool call — the event waited for that call to return. Whether a
+*fully* idle session is woken into a new turn is **unverified**.
+
+Note: `feedEnabled` resets to off on restart, so a restarted server delivers to
+the queue until the feed is re-enabled.
+
+### Regression: none
+`9/10 driver` (the 1 is the inverted starvation probe), `5/6 abort` (the
+protocol-inherent sub-5 ms window), `12/12 adversarial`, `9/9 pid/orphan/409`,
+batch-loss fix intact.
+
+---
+
 ## v3.6.3 — The bridge can now actually survive weeks
 
 Found by a 145-minute soak test across two concurrent runs — 204,000 messages,
