@@ -46,6 +46,10 @@ interface IncomingMessage {
   fileSize?: number;
   location?: { latitude: number; longitude: number };
   contact?: { phone: string; firstName: string; lastName?: string };
+  /** Media only: download state. "pending" while the background download runs. */
+  fileStatus?: "pending" | "done" | "failed";
+  /** Media only: settles (never rejects) to the final message once the download finishes or fails. */
+  filePromise?: Promise<IncomingMessage>;
 }
 
 interface CallbackData { id: string; data: string; from: string; messageId: number }
@@ -110,22 +114,6 @@ function uniqueName(prefix: string, ext: string): string {
   return `${prefix}_${ts}_${rand}${ext}`;
 }
 
-/**
- * Reduce a Telegram-supplied file name to a safe basename INSIDE DOWNLOAD_DIR.
- * Names arrive from the sender (document/video/audio file_name) and must never
- * be able to steer the write anywhere else, nor clobber an existing file.
- */
-function safeTargetName(rawName: string): string {
-  let base = path.basename(String(rawName)).replace(/\0/g, "").replace(/^\.+/, "");
-  if (base.length > 120) base = base.slice(-120);
-  if (!base) base = uniqueName("file", "");
-  if (fs.existsSync(path.join(DOWNLOAD_DIR, base))) {
-    const ext = path.extname(base);
-    base = `${path.basename(base, ext)}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext}`;
-  }
-  return base;
-}
-
 /** Path sandbox: cleanup may only ever touch files inside DOWNLOAD_DIR. */
 function isInDownloadDir(p: string): boolean {
   const resolved = path.resolve(p);
@@ -152,8 +140,8 @@ async function downloadFile(fileId: string, suggestedName?: string, knownSize?: 
   }
   const filePath = file.file_path!;
   const ext = path.extname(filePath) || "";
-  // Sender-controlled names are sanitised at this choke point: every caller of
-  // downloadFile is covered, so a hostile file_name can never escape DOWNLOAD_DIR.
+  // Sender-controlled names are sanitised at this choke point too, so any
+  // future caller of downloadFile is covered, not just withFileDownload.
   const fileName = safeTargetName(suggestedName || `${fileId}${ext}`);
   const localPath = path.join(DOWNLOAD_DIR, fileName);
   const url = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${filePath}`;
@@ -187,34 +175,101 @@ const CONFUSING_EXTS = [".ts"]; // Telegram treats .ts as MPEG Transport Stream
 
 // --- Message Processing ---
 
-async function processMessage(msg: Message): Promise<IncomingMessage> {
+/**
+ * Reduce a Telegram-supplied file name to a safe basename INSIDE DOWNLOAD_DIR.
+ * Names arrive from the sender (document/video/audio file_name) and must never
+ * be able to steer the write anywhere else, nor clobber an existing file.
+ */
+function safeTargetName(rawName: string): string {
+  let base = path.basename(String(rawName)).replace(/\0/g, "").replace(/^\.+/, "");
+  if (base.length > 120) base = base.slice(-120);
+  if (!base) base = uniqueName("file", "");
+  if (fs.existsSync(path.join(DOWNLOAD_DIR, base))) {
+    const ext = path.extname(base);
+    base = `${path.basename(base, ext)}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext}`;
+  }
+  return base;
+}
+
+/**
+ * Attach a BACKGROUND file download to a media message. The message is usable
+ * immediately (filePath is the deterministic target path); `filePromise`
+ * settles to the final message when the download finishes.
+ *
+ * FALLBACK (single decision point): if the download succeeds the message is
+ * delivered in full, exactly like before. If it fails, the message degrades to
+ * the same plain-text fallback the old inline code produced — nothing errors,
+ * nothing hangs the pipeline.
+ */
+function withFileDownload(base: IncomingMessage, fileId: string, rawName: string, size?: number): IncomingMessage {
+  const name = safeTargetName(rawName);
+  base.fileName = name;
+  base.filePath = path.join(DOWNLOAD_DIR, name);
+  base.fileStatus = "pending";
+  base.filePromise = downloadFile(fileId, name, size)
+    .then(() => {
+      base.fileStatus = "done";
+      return base;
+    })
+    .catch((err) => {
+      // Same shape as the old inline error path: deliver as text, keep going.
+      base.fileStatus = "failed";
+      const reason = err instanceof Error ? err.message : "download failed";
+      base.text = base.caption || `[${base.type} — ${reason}]`;
+      base.type = "text";
+      // Drop every field that implies a file the consumer can open — a "text"
+      // message must not carry filePath/fileName/mimeType/fileSize.
+      delete base.filePath;
+      delete base.fileName;
+      delete base.mimeType;
+      delete base.fileSize;
+      return base;
+    });
+  return base;
+}
+
+/** Settle a message's background download (instant for non-media / completed ones). */
+function settled(msg: IncomingMessage): Promise<IncomingMessage> {
+  return msg.filePromise ?? Promise.resolve(msg);
+}
+
+/**
+ * Classify an update into an IncomingMessage SYNCHRONOUSLY — nothing here can
+ * block, so the grammY update loop (which handles updates sequentially) is
+ * never stalled by a slow download. Downloads run in the background.
+ */
+function classifyMessage(msg: Message): IncomingMessage {
   const from = msg.from?.first_name || msg.from?.username || "User";
   const date = msg.date;
   const caption = msg.caption;
 
   if (msg.photo && msg.photo.length > 0) {
     const largest = msg.photo[msg.photo.length - 1];
-    const { localPath, fileName } = await downloadFile(largest.file_id, uniqueName("photo", ".jpg"), largest.file_size);
-    return { text: caption || "[Photo]", from, date, type: "photo", filePath: localPath, fileName, caption, fileSize: largest.file_size };
+    return withFileDownload(
+      { text: caption || "[Photo]", from, date, type: "photo", caption, fileSize: largest.file_size },
+      largest.file_id, uniqueName("photo", ".jpg"), largest.file_size);
   }
   if (msg.video) {
-    const vidName = msg.video.file_name || uniqueName("video", ".mp4");
-    const { localPath, fileName } = await downloadFile(msg.video.file_id, vidName, msg.video.file_size);
-    return { text: caption || "[Video]", from, date, type: "video", filePath: localPath, fileName, caption, mimeType: msg.video.mime_type, fileSize: msg.video.file_size };
+    return withFileDownload(
+      { text: caption || "[Video]", from, date, type: "video", caption, mimeType: msg.video.mime_type, fileSize: msg.video.file_size },
+      msg.video.file_id, msg.video.file_name || uniqueName("video", ".mp4"), msg.video.file_size);
   }
   if (msg.voice) {
-    const { localPath, fileName } = await downloadFile(msg.voice.file_id, uniqueName("voice", ".ogg"), msg.voice.file_size);
-    return { text: "[Voice message]", from, date, type: "voice", filePath: localPath, fileName, mimeType: msg.voice.mime_type, fileSize: msg.voice.file_size };
+    return withFileDownload(
+      { text: "[Voice message]", from, date, type: "voice", mimeType: msg.voice.mime_type, fileSize: msg.voice.file_size },
+      msg.voice.file_id, uniqueName("voice", ".ogg"), msg.voice.file_size);
   }
   if (msg.audio) {
     const audioName = msg.audio.file_name || uniqueName("audio", ".mp3");
-    const { localPath, fileName } = await downloadFile(msg.audio.file_id, audioName, msg.audio.file_size);
-    return { text: caption || `[Audio: ${msg.audio.title || fileName}]`, from, date, type: "audio", filePath: localPath, fileName, caption, mimeType: msg.audio.mime_type, fileSize: msg.audio.file_size };
+    return withFileDownload(
+      { text: caption || `[Audio: ${msg.audio.title || audioName}]`, from, date, type: "audio", caption, mimeType: msg.audio.mime_type, fileSize: msg.audio.file_size },
+      msg.audio.file_id, audioName, msg.audio.file_size);
   }
   if (msg.document) {
     const docName = msg.document.file_name || uniqueName("doc", path.extname(msg.document.file_name || "") || "");
-    const { localPath, fileName } = await downloadFile(msg.document.file_id, docName, msg.document.file_size);
-    return { text: caption || `[Document: ${fileName}]`, from, date, type: "document", filePath: localPath, fileName, caption, mimeType: msg.document.mime_type, fileSize: msg.document.file_size };
+    return withFileDownload(
+      { text: caption || `[Document: ${docName}]`, from, date, type: "document", caption, mimeType: msg.document.mime_type, fileSize: msg.document.file_size },
+      msg.document.file_id, docName, msg.document.file_size);
   }
   if (msg.sticker) {
     return { text: `[Sticker: ${msg.sticker.emoji || ""} ${msg.sticker.set_name || ""}]`, from, date, type: "sticker" };
@@ -265,30 +320,24 @@ function formatReturnContent(msg: IncomingMessage): ToolContent {
 
 // --- Event Listeners ---
 
-bot.on("message", async (ctx) => {
+// SYNCHRONOUS on purpose: the handler must never await anything, so one slow
+// media download can never stall delivery of the messages behind it (grammY
+// handles updates strictly sequentially). Downloads run in the background via
+// withFileDownload; failures degrade to the plain-text fallback there.
+bot.on("message", (ctx) => {
   const msg = ctx.message;
   if (msg.chat.id !== chatId) return;
-  try {
-    const incoming = await processMessage(msg);
-    if (waitingResolver) {
-      const resolve = waitingResolver;
-      clearResolvers();
-      resolve(incoming);
-    } else {
-      messageQueue.push(incoming);
-      const preview = incoming.type === "text"
-        ? incoming.text.slice(0, 100)
-        : `[${incoming.type}] ${incoming.caption || incoming.text}`.slice(0, 100);
-      log("warning", `New Telegram ${incoming.type} from ${incoming.from}: "${preview}". Call check_messages to read it.`);
-    }
-  } catch (err) {
-    const reason = err instanceof Error ? err.message : "download failed";
-    const fallback: IncomingMessage = {
-      text: msg.text || msg.caption || `[${msg.photo ? "photo" : msg.video ? "video" : "media"} — ${reason}]`,
-      from: msg.from?.first_name || msg.from?.username || "User", date: msg.date, type: "text",
-    };
-    if (waitingResolver) { const resolve = waitingResolver; clearResolvers(); resolve(fallback); }
-    else messageQueue.push(fallback);
+  const incoming = classifyMessage(msg);
+  if (waitingResolver) {
+    // NOTE: not cleared here — an active wait keeps listening until it finishes
+    // (first settled message wins; late settlers are re-queued by the waiter).
+    waitingResolver(incoming);
+  } else {
+    messageQueue.push(incoming);
+    const preview = incoming.type === "text"
+      ? incoming.text.slice(0, 100)
+      : `[${incoming.type}] ${incoming.caption || incoming.text}`.slice(0, 100);
+    log("warning", `New Telegram ${incoming.type} from ${incoming.from}: "${preview}". Call check_messages to read it.`);
   }
 });
 
@@ -411,14 +460,6 @@ server.tool(
     timeout_seconds: z.number().optional().describe("Optional: give up after this many seconds and return {timeout:true}. Omit to wait indefinitely."),
   },
   async ({ timeout_seconds }, extra) => {
-    // Drain queues first
-    if (messageQueue.length > 0) {
-      const msg = messageQueue.shift()!;
-      if (msg.type === "text" && STOP_WORDS.includes(msg.text.trim().toLowerCase())) {
-        return ok({ stop: true, codeword: msg.text.trim() });
-      }
-      return { content: formatReturnContent(msg) };
-    }
     if (callbackQueue.length > 0) {
       const cb = callbackQueue.shift()!;
       return ok({ button_data: cb.data, from: cb.from, message_id: cb.messageId });
@@ -432,23 +473,49 @@ server.tool(
       | { type: "aborted" };
 
     const result = await new Promise<WaitResult>((resolve) => {
+      let done = false;
       let timer: ReturnType<typeof setTimeout> | undefined;
-      const finish = (r: WaitResult) => {
+      /** Ends the wait exactly once. Returns false if the wait already ended. */
+      const finish = (r: WaitResult): boolean => {
+        if (done) return false;
+        done = true;
         if (timer) clearTimeout(timer);
         extra.signal?.removeEventListener("abort", onAbort);
         clearResolvers();
         resolve(r);
+        return true;
       };
       const onAbort = () => finish({ type: "aborted" });
 
-      waitingResolver = (msg) => finish({ type: "message", msg });
+      // Deliver a message once its background download (if any) settles.
+      // The caller's own timeout stays authoritative: if it fires first, the
+      // late-settling message is re-queued instead of being lost, and the next
+      // wait/check picks it up with the file already on disk.
+      const deliver = (msg: IncomingMessage) => {
+        settled(msg).then((final) => {
+          // If the caller already went away, never burn the message on a
+          // response that will be discarded — put it back at the FRONT so
+          // arrival order survives.
+          if (extra.signal?.aborted || !finish({ type: "message", msg: final })) messageQueue.unshift(final);
+        });
+      };
+
+      waitingResolver = deliver;
       callbackResolver = (cb) => finish({ type: "button", cb });
       if (timeout_seconds && timeout_seconds > 0) {
         timer = setTimeout(() => finish({ type: "timeout" }), timeout_seconds * 1000);
       }
       if (extra.signal) {
-        if (extra.signal.aborted) return onAbort();
+        if (extra.signal.aborted) { onAbort(); return; }
         extra.signal.addEventListener("abort", onAbort, { once: true });
+      }
+
+      // Drain: hand the first ready queued message to the same delivery path.
+      // Prefer one whose download already settled; fall back to the head.
+      if (messageQueue.length > 0) {
+        let idx = messageQueue.findIndex((m) => m.fileStatus !== "pending");
+        if (idx === -1) idx = 0;
+        deliver(messageQueue.splice(idx, 1)[0]);
       }
     });
 
@@ -461,6 +528,13 @@ server.tool(
         return ok({ button_data: result.cb.data, from: result.cb.from, message_id: result.cb.messageId });
       case "message": {
         const msg = result.msg;
+        // Last-moment cancellation check. The MCP SDK drops the response of a
+        // cancelled request, so consuming the message here would lose it.
+        // Checked as late as possible, immediately before returning.
+        if (extra.signal?.aborted) {
+          messageQueue.unshift(msg);
+          return ok({ aborted: true });
+        }
         if (msg.type === "text" && STOP_WORDS.includes(msg.text.trim().toLowerCase())) {
           return ok({ stop: true, codeword: msg.text.trim() });
         }
@@ -480,7 +554,14 @@ server.tool(
     const callbacks = callbackQueue.splice(0);
     const results: Record<string, unknown>[] = [];
 
-    for (const msg of messages) {
+    for (const raw of messages) {
+      // Non-blocking contract: never wait on an in-flight download here.
+      // Report it as downloading; the file lands at filePath when done.
+      if (raw.fileStatus === "pending") {
+        results.push({ ...formatMessage(raw), fileStatus: "downloading" });
+        continue;
+      }
+      const msg = await settled(raw); // instant: already settled (or non-media)
       if (msg.type === "text" && STOP_WORDS.includes(msg.text.trim().toLowerCase())) {
         return ok({ stop: true, codeword: msg.text.trim(), pending: results });
       }
