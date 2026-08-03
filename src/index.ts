@@ -110,6 +110,22 @@ function uniqueName(prefix: string, ext: string): string {
   return `${prefix}_${ts}_${rand}${ext}`;
 }
 
+/**
+ * Reduce a Telegram-supplied file name to a safe basename INSIDE DOWNLOAD_DIR.
+ * Names arrive from the sender (document/video/audio file_name) and must never
+ * be able to steer the write anywhere else, nor clobber an existing file.
+ */
+function safeTargetName(rawName: string): string {
+  let base = path.basename(String(rawName)).replace(/\0/g, "").replace(/^\.+/, "");
+  if (base.length > 120) base = base.slice(-120);
+  if (!base) base = uniqueName("file", "");
+  if (fs.existsSync(path.join(DOWNLOAD_DIR, base))) {
+    const ext = path.extname(base);
+    base = `${path.basename(base, ext)}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext}`;
+  }
+  return base;
+}
+
 /** Path sandbox: cleanup may only ever touch files inside DOWNLOAD_DIR. */
 function isInDownloadDir(p: string): boolean {
   const resolved = path.resolve(p);
@@ -136,12 +152,31 @@ async function downloadFile(fileId: string, suggestedName?: string, knownSize?: 
   }
   const filePath = file.file_path!;
   const ext = path.extname(filePath) || "";
-  const fileName = suggestedName || `${fileId}${ext}`;
+  // Sender-controlled names are sanitised at this choke point: every caller of
+  // downloadFile is covered, so a hostile file_name can never escape DOWNLOAD_DIR.
+  const fileName = safeTargetName(suggestedName || `${fileId}${ext}`);
   const localPath = path.join(DOWNLOAD_DIR, fileName);
   const url = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${filePath}`;
   const response = await fetch(url);
   if (!response.ok) throw new Error(`Download failed: HTTP ${response.status}`);
-  const buffer = Buffer.from(await response.arrayBuffer());
+  // Bounded read: never buffer more than the documented limit, even if the
+  // server under-declares file_size or omits content-length. Size limit only —
+  // no clock involved.
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error("Download failed: empty response body");
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > MAX_DOWNLOAD_BYTES) {
+      await reader.cancel().catch(() => {});
+      throw new Error(`File exceeds the ${MAX_DOWNLOAD_BYTES / 1048576} MB Telegram download limit.`);
+    }
+    chunks.push(Buffer.from(value));
+  }
+  const buffer = Buffer.concat(chunks);
   fs.writeFileSync(localPath, buffer);
   return { localPath, fileName };
 }
