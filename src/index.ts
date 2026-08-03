@@ -71,7 +71,7 @@ function clearResolvers() {
 // --- MCP server (declared early so the bot handlers can log through it) ---
 
 const server = new McpServer(
-  { name: "telegram-chat-mcp", version: "3.4.0" },
+  { name: "telegram-chat-mcp", version: "3.5.0" },
   { capabilities: { logging: {} } }
 );
 
@@ -744,7 +744,7 @@ async function main() {
   // tools then return errors, and the failure is visible instead of fatal.
   bot.start({
     allowed_updates: ["message", "callback_query"],
-    onStart: () => { process.stderr.write("[telegram-mcp] polling started (v3.4.0, grammY)\n"); },
+    onStart: () => { process.stderr.write("[telegram-mcp] polling started (v3.5.0, grammY)\n"); },
   }).catch((err) => {
     log("error", `Telegram polling failed to start: ${err instanceof Error ? err.message : String(err)}`);
   });

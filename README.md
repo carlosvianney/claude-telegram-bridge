@@ -36,6 +36,7 @@ The official Claude Code Channels (Telegram plugin) only works in the CLI. This 
 - `check_messages` for non-blocking queue reads
 - MCP logging notifications when messages arrive while not listening
 - Structured error results (`isError`) on every tool; file-size guards (20 MB download / 50 MB upload limits reported clearly)
+- Media downloads run in the background (v3.5) — a slow photo can no longer delay the text messages behind it
 
 ## Tools
 
@@ -157,6 +158,18 @@ This is an MCP (Model Context Protocol) server that connects Claude Code to a Te
 
 The bot runs inside the MCP server process. No separate service, no webhook setup, no public URL needed. It starts when Claude Code loads the MCP config and stops when the session ends.
 
+## Security
+
+Media filenames arrive from the sender and are never trusted. Every download
+target is reduced to a safe basename inside `DOWNLOAD_DIR` (no directory
+components, no null bytes, length-bounded, random suffix on collision), and
+downloads use a byte-counting bounded read so a server that lies about
+`file_size` cannot write past the 20 MB limit.
+
+**If you are running a version before v3.5.0, update.** A malicious `file_name`
+could escape the download directory and overwrite arbitrary files. Details in
+[CHANGELOG.md](CHANGELOG.md).
+
 ## Limitations
 
 - **One chat only** — the `CHAT_ID` env var locks it to a single conversation
@@ -164,8 +177,22 @@ The bot runs inside the MCP server process. No separate service, no webhook setu
 - **No push notifications** — Claude can't initiate a turn from Telegram. You text first, Claude responds.
 - **Telegram file size limit** — bots can download files up to 20 MB and upload up to 50 MB
 
+## Known Issues
+
+The honest list of what still breaks — including a silent failure mode where
+the bridge stops receiving and never recovers — is in
+**[KNOWN-ISSUES.md](KNOWN-ISSUES.md)**.
+
+Short version: if the bridge goes quiet, restart the MCP server and check for
+stray processes (`ps aux | grep telegram`). A duplicate consumer of the same
+bot token kills polling permanently, and today that looks exactly like nobody
+texting you.
+
 ## Changelog
 
+Full history in **[CHANGELOG.md](CHANGELOG.md)**.
+
+- **v3.5.0** — Fixed: one slow media download blocked every other message (downloads moved off the update loop — no timeouts added). Security: arbitrary file write via `file_name` (path traversal), and unbounded download despite the declared 20 MB limit. Also: messages arriving during a client abort are no longer swallowed, and failed downloads no longer carry stale file metadata.
 - **v3.4.0** — Engine migration to [grammY](https://grammy.dev) (typed Bot API, no deprecated dependencies) with automatic 429/network retry. Formatter rewritten: the long-standing backtick/`<code>` rendering bug is fixed at the root (escape-once pipeline, placeholder-protected code spans, chunk-before-format so code blocks never split). `wait_for_message` gains `timeout_seconds` + abort cleanup. `transcribe_audio`/`process_video` gain `keepFile` and no longer delete files outside the download dir. Structured `isError` results, download/upload size guards, sandboxed cleanup paths, graceful startup failure.
 - **v3.2.0** — Fix silent polling errors, shell injection, message handling bugs.
 - **v3.1** — Full two-way Telegram MCP for Claude Code.
