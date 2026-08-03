@@ -96,7 +96,7 @@ function clearResolvers() {
 // --- MCP server (declared early so the bot handlers can log through it) ---
 
 const server = new McpServer(
-  { name: "telegram-chat-mcp", version: "3.6.2" },
+  { name: "telegram-chat-mcp", version: "3.6.3" },
   { capabilities: { logging: {} } }
 );
 
@@ -872,6 +872,14 @@ type PollingState = "starting" | "running" | "stopped";
 let pollingState: PollingState = "starting";
 let pollingError = "";
 const POLL_MAX_ATTEMPTS = 8;
+/**
+ * Failures separated by more than this are independent EPISODES, not one
+ * ongoing outage. Without this the budget is a LIFETIME allowance: a handful
+ * of unrelated blips weeks apart would exhaust it and exit a healthy process.
+ */
+const POLL_EPISODE_GAP_MS = 30_000; // 3x the max backoff: proves we polled fine in between
+let pollAttempt = 0;
+let lastPollFailureAt = 0;
 
 /**
  * The single guard that makes a dead poller VISIBLE. Previously a dead loop
@@ -885,14 +893,14 @@ function pollingFailure(): { content: ToolContent; isError: true } | null {
 }
 
 async function runPolling(): Promise<void> {
-  for (let attempt = 1; attempt <= POLL_MAX_ATTEMPTS; attempt++) {
+  for (;;) {
     try {
       await bot.start({
         allowed_updates: ["message", "callback_query"],
         onStart: () => {
           pollingState = "running";
           pollingError = "";
-          process.stderr.write("[telegram-mcp] polling started (v3.6.2, grammY)\n");
+          process.stderr.write("[telegram-mcp] polling started (v3.6.3, grammY)\n");
         },
       });
       return; // resolved only via bot.stop()
@@ -900,6 +908,11 @@ async function runPolling(): Promise<void> {
       const ge = err instanceof GrammyError ? err : null;
       pollingState = "stopped";
       pollingError = ge ? `${ge.error_code}: ${ge.description}` : String(err instanceof Error ? err.message : err);
+
+      const now = Date.now();
+      if (now - lastPollFailureAt > POLL_EPISODE_GAP_MS) pollAttempt = 0; // new episode
+      lastPollFailureAt = now;
+      pollAttempt++;
 
       // Bad token: retrying cannot help.
       if (ge?.error_code === 401) {
@@ -913,12 +926,12 @@ async function runPolling(): Promise<void> {
         log("error", `Another telegram-mcp (pid=${rec.pid}) owns this bot token. Exiting.`);
         return shutdown(1);
       }
-      if (attempt === POLL_MAX_ATTEMPTS) {
-        log("error", `Telegram polling failed ${attempt}x (${pollingError}). Exiting so the MCP host can restart it.`);
+      if (pollAttempt >= POLL_MAX_ATTEMPTS) {
+        log("error", `Telegram polling failed ${pollAttempt}x in a row (${pollingError}). Exiting so the MCP host can restart it.`);
         return shutdown(1);
       }
-      const delay = Math.min(500 * 2 ** (attempt - 1), 10000);
-      log("warning", `Telegram polling error (${pollingError}); retry ${attempt}/${POLL_MAX_ATTEMPTS} in ${delay}ms.`);
+      const delay = Math.min(500 * 2 ** (pollAttempt - 1), 10000);
+      log("warning", `Telegram polling error (${pollingError}); retry ${pollAttempt}/${POLL_MAX_ATTEMPTS} in ${delay}ms.`);
       await new Promise((r) => setTimeout(r, delay));
     }
   }
@@ -926,7 +939,35 @@ async function runPolling(): Promise<void> {
 
 // --- Start ---
 
+/**
+ * Nothing ever reclaimed DOWNLOAD_DIR: it grows 1:1 with received media,
+ * forever. Measured linear in a 90-minute soak with no reclamation across 26
+ * restarts — roughly 1.3 GB over three weeks at 20 photos/day. Reclaimed once
+ * at startup; size-based, no timer.
+ */
+const RETAIN_DOWNLOAD_DAYS = Number(process.env.RETAIN_DOWNLOAD_DAYS || 7);
+function reclaimDownloadDir(): void {
+  if (RETAIN_DOWNLOAD_DAYS <= 0) return; // opt out
+  const cutoff = Date.now() - RETAIN_DOWNLOAD_DAYS * 86_400_000;
+  let removed = 0;
+  try {
+    for (const name of fs.readdirSync(DOWNLOAD_DIR)) {
+      if (name === "telegram-mcp.pid") continue;
+      const full = path.join(DOWNLOAD_DIR, name);
+      try {
+        const st = fs.statSync(full);
+        if (st.mtimeMs >= cutoff) continue;
+        if (st.isDirectory()) fs.rmSync(full, { recursive: true });
+        else fs.unlinkSync(full);
+        removed++;
+      } catch {}
+    }
+  } catch {}
+  if (removed > 0) log("info", `Reclaimed ${removed} media file(s) older than ${RETAIN_DOWNLOAD_DAYS} days from ${DOWNLOAD_DIR}.`);
+}
+
 async function main() {
+  reclaimDownloadDir();
   // Negative chat IDs are groups/supergroups. Room-gating a group means every
   // member can drive this session, and send_file has no sandbox.
   if (chatId < 0 && ALLOWED_USER_IDS.size === 0) {

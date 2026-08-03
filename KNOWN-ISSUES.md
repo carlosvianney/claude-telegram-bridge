@@ -84,9 +84,29 @@ out to remove.
 
 ---
 
-## 4. A trickling download can hold a connection open indefinitely
+## 4. A trickling download leaks a file descriptor
 
-**Severity: low. Improved, not eliminated.**
+**Severity: low-medium. Improved over v3.5.0, not eliminated. Quantified in a
+soak test.**
+
+Downloads run in the background, so a slow one no longer blocks any messages,
+and the bounded read caps memory and disk at `MAX_DOWNLOAD_BYTES`. But nothing
+cancels a read that never completes: the socket and its promise chain persist
+for the life of the process.
+
+Measured at an artificially extreme stall rate (2.4 trickles/minute), file
+descriptors climbed ~2/minute — close to 1 fd per stalled download — with a
+positive slope in all eight measured segments, from a baseline of 22 to a peak
+of 49. Only a restart reclaims them. At that rate a 1024 soft limit would be
+reached in about 8 hours; at realistic stall rates far slower, but still
+unbounded.
+
+Strictly better than the pre-v3.5.0 behaviour, where the same trickle blocked
+*every* message.
+
+**Planned fix (no clock):** cap concurrent in-flight downloads and evict the
+oldest with `reader.cancel()` when the cap is hit — bounding fds by
+construction and degrading the evicted message to the existing text fallback.
 
 Downloads now run in the background, so a slow one no longer blocks any
 messages, and the bounded read caps memory and disk at `MAX_DOWNLOAD_BYTES`.

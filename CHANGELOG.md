@@ -4,6 +4,69 @@ All notable changes to this project are documented here.
 
 ---
 
+## v3.6.3 — The bridge can now actually survive weeks
+
+Found by a 145-minute soak test across two concurrent runs — 204,000 messages,
+3,679 tool calls, 406 client aborts, 34 restarts. Every earlier round tested a
+*single* fault; the soak tested many, and that is what exposed the defect below.
+
+### Fixed — the retry budget was a lifetime allowance, not a per-outage one (regression, v3.6.0)
+
+`runPolling()` counted retries with `for (let attempt = 1; attempt <= 8; ...)`,
+which never reset on recovery. Every transient conflict permanently consumed
+2-4 of the budget, so after roughly 3-5 **independent** blips the process
+exited — no matter how healthy it had been in between.
+
+Observed in the soak: 8 restarts with **zero** 401s injected, each immediately
+after an unrelated 409 episode. Isolated repro across three 6-second episodes
+separated by ~45 s of verified healthy delivery:
+
+```
+before:  retry attempts observed [1, 2, 3, 4, 5, 6]   — strictly monotonic
+after:   [1, 2, 3, 4,  1, 2, 3, 4,  1, 2, 3, 4]       — resets per episode
+```
+
+Over a multi-week uptime that was not a risk, it was a certainty — the single
+thing standing between this bridge and unattended operation. Introduced by the
+supervisor added in v3.6.0.
+
+Fixed by treating a failure separated from the previous one by more than
+`POLL_EPISODE_GAP_MS` (30 s — 3× the maximum backoff, so we demonstrably polled
+fine in between) as a new episode. Both directions verified: independent blips
+no longer accumulate, and a genuine sustained outage still exits after 8
+consecutive failures. Error-path episode detection, not a message-path timer.
+
+### Added — `DOWNLOAD_DIR` is reclaimed at startup
+
+Nothing ever cleaned it up. Growth measured perfectly linear across 90 minutes
+and 26 restarts, at 1:1 with received media — roughly **1.3 GB over three
+weeks** at 20 photos a day, in `/tmp`.
+
+Files older than `RETAIN_DOWNLOAD_DAYS` (default 7) are removed once at
+startup. Set it to `0` to opt out. Age-based, no timer, no background job.
+
+### Confirmed clean over 204,000 messages
+
+- **No memory leak.** RSS slope 0.001 MB/min over 90 minutes, oscillating
+  77-107 MB and returning to baseline repeatedly.
+- **No listener or handler accumulation** across 3,679 tool calls including
+  406 aborts — the abort cleanup path holds at scale.
+- **Exactly one pid file, always**, across 34 restarts and takeovers. Zero
+  orphans. The v3.6.0 lifecycle layer is solid under churn.
+- **Queue bounds hold** — 258 drop warnings surfaced correctly, no growth past
+  500.
+- Restart attribution was 1:1 with injected faults; no unexplained exits.
+
+### Still open
+
+A file descriptor leaks per never-completing download (~1 fd per stalled
+transfer, reclaimed only on restart) — see KNOWN-ISSUES. Bounded in practice,
+unbounded in principle. And a definitive multi-day memory answer needs a
+restart-free run that did not fit in this session; the 90-minute trend is flat,
+but that is stated as **unconfirmed**, not as a pass.
+
+---
+
 ## v3.6.2 — Gate on identity, not just the room
 
 Found during a competitive review against the official Claude Code Telegram
