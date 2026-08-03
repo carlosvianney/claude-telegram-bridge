@@ -28,6 +28,24 @@ if (!TELEGRAM_TOKEN || !CHAT_ID) {
 
 const chatId = Number(CHAT_ID);
 
+/**
+ * Optional sender allowlist (comma-separated Telegram user IDs).
+ *
+ * CHAT_ID alone is a ROOM gate, not an identity gate. In a one-to-one chat the
+ * two coincide, but if CHAT_ID is ever a GROUP, every member of that group can
+ * inject messages into the session — and this server exposes send_file. Set
+ * ALLOWED_USER_IDS to gate on who is speaking, not merely where.
+ */
+const ALLOWED_USER_IDS = new Set(
+  (process.env.ALLOWED_USER_IDS || "")
+    .split(",").map((s) => s.trim()).filter(Boolean).map(Number).filter((n) => Number.isFinite(n))
+);
+
+/** Empty allowlist = accept anyone in the gated chat (previous behaviour). */
+function isAllowedSender(fromId?: number): boolean {
+  return ALLOWED_USER_IDS.size === 0 || (typeof fromId === "number" && ALLOWED_USER_IDS.has(fromId));
+}
+
 if (!fs.existsSync(DOWNLOAD_DIR)) {
   fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
 }
@@ -78,7 +96,7 @@ function clearResolvers() {
 // --- MCP server (declared early so the bot handlers can log through it) ---
 
 const server = new McpServer(
-  { name: "telegram-chat-mcp", version: "3.6.1" },
+  { name: "telegram-chat-mcp", version: "3.6.2" },
   { capabilities: { logging: {} } }
 );
 
@@ -334,6 +352,7 @@ function formatReturnContent(msg: IncomingMessage): ToolContent {
 bot.on("message", (ctx) => {
   const msg = ctx.message;
   if (msg.chat.id !== chatId) return;
+  if (!isAllowedSender(msg.from?.id)) return; // identity gate, not just room
   const incoming = classifyMessage(msg);
   if (waitingResolver) {
     // NOTE: not cleared here — an active wait keeps listening until it finishes
@@ -355,6 +374,7 @@ bot.on("message", (ctx) => {
 bot.on("callback_query", async (ctx) => {
   const query = ctx.callbackQuery;
   if (!query.message || query.message.chat.id !== chatId) return;
+  if (!isAllowedSender(query.from?.id)) return; // identity gate, not just room
   const cb: CallbackData = {
     id: query.id, data: query.data || "",
     from: query.from.first_name || query.from.username || "User",
@@ -872,7 +892,7 @@ async function runPolling(): Promise<void> {
         onStart: () => {
           pollingState = "running";
           pollingError = "";
-          process.stderr.write("[telegram-mcp] polling started (v3.6.1, grammY)\n");
+          process.stderr.write("[telegram-mcp] polling started (v3.6.2, grammY)\n");
         },
       });
       return; // resolved only via bot.stop()
@@ -907,6 +927,14 @@ async function runPolling(): Promise<void> {
 // --- Start ---
 
 async function main() {
+  // Negative chat IDs are groups/supergroups. Room-gating a group means every
+  // member can drive this session, and send_file has no sandbox.
+  if (chatId < 0 && ALLOWED_USER_IDS.size === 0) {
+    process.stderr.write(
+      "[telegram-mcp] WARNING: CHAT_ID is a group and ALLOWED_USER_IDS is unset — " +
+      "any group member can inject messages into this session. Set ALLOWED_USER_IDS.\n"
+    );
+  }
   claimPollingSlot();
 
   const transport = new StdioServerTransport();

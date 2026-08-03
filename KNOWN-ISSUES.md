@@ -170,7 +170,18 @@ inside an existing session.
 - **One chat only** — `CHAT_ID` locks the server to a single conversation.
 - **No cold activation** — the server cannot start a turn on its own. It only
   receives while a session is calling into it, so messages sent while nothing
-  is polling wait in the queue until something drains them.
+  is polling wait in the queue until something drains them. Nothing a plain MCP
+  server can do fixes this: the official channel API (turn injection) is CLI-only
+  and allowlist-gated. Officially, **Dispatch** solves it; self-hosted,
+  [RichardAtCT/claude-code-telegram](https://github.com/RichardAtCT/claude-code-telegram)
+  solves it by owning the bot in a daemon and spawning `claude -p` itself.
+- **MCP logging notifications do not surface.** The server calls
+  `sendLoggingMessage`, but Claude Code does not display `notifications/message`
+  ([claude-code#3174](https://github.com/anthropics/claude-code/issues/3174),
+  closed NOT_PLANNED; [#33679](https://github.com/anthropics/claude-code/issues/33679)
+  is the open re-request). Combined with issue 2 above, the server currently has
+  **no working out-of-band notification path**. The README claimed otherwise
+  until v3.6.2; the claim has been removed.
 - **Telegram file limits** — 20 MB download, 50 MB upload, imposed by the Bot
   API.
 

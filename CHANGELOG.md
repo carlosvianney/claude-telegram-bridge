@@ -4,6 +4,48 @@ All notable changes to this project are documented here.
 
 ---
 
+## v3.6.2 — Gate on identity, not just the room
+
+Found during a competitive review against the official Claude Code Telegram
+channel plugin.
+
+### Fixed — `CHAT_ID` alone is a room gate, not an identity gate
+
+Both inbound handlers checked only `msg.chat.id !== chatId`. In a one-to-one
+chat the room and the sender coincide, so this was adequate. **If `CHAT_ID` is
+a group**, it is not: every member of that group could inject messages into the
+session — and `send_file` has no sandbox, so that is a direct path to reading
+files off the machine.
+
+Anthropic's own channel guidance is explicit about this: gate on the sender's
+identity, not the chat or room identity, because in group chats the two differ.
+
+- New optional `ALLOWED_USER_IDS` (comma-separated Telegram user IDs), enforced
+  on both messages and callback queries.
+- Backwards compatible: an unset allowlist keeps the previous behaviour, so
+  existing one-to-one setups are unaffected.
+- The server now warns at startup when `CHAT_ID` is a group (negative ID) and
+  no allowlist is set.
+
+### Fixed — the README advertised a feature that does nothing
+
+"MCP logging notifications when messages arrive while not listening" never
+worked. Claude Code does not surface `notifications/message`
+([claude-code#3174](https://github.com/anthropics/claude-code/issues/3174),
+closed NOT_PLANNED). Combined with stderr not being captured after startup,
+the server has **no working out-of-band notification path** at all. The claim
+is removed and the reality is documented in KNOWN-ISSUES.md.
+
+### Changed — honest positioning in the README
+
+The README now points readers at the official Telegram channel plugin (CLI,
+has permission approval and pairing), at Remote Control (official, zero setup,
+works in VS Code), and at Happy — and states plainly the narrower cases where
+this bridge is the better choice: the VS Code extension, transcribed voice
+notes and video, and self-hosting with any auth setup.
+
+---
+
 ## v3.6.1 — One bad message no longer destroys the batch
 
 ### Fixed — a malformed update discarded every queued message with it

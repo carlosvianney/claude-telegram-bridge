@@ -2,7 +2,22 @@
 
 Two-way Telegram chat for Claude Code. Text Claude from your phone, get instant responses in your existing session.
 
-The official Claude Code Channels (Telegram plugin) only works in the CLI. This MCP server brings real-time two-way Telegram messaging to the **VS Code extension** — same session, same context, no compromises.
+The official Claude Code Telegram channel is CLI-only
+([claude-plugins-official#778](https://github.com/anthropics/claude-plugins-official/issues/778)
+is still open). This is an ordinary MCP server, so it works in the **VS Code
+extension**, JetBrains, Cursor, Claude Desktop and the CLI alike.
+
+**Use something else if it fits you better:**
+- On the CLI? The **official Telegram channel plugin** has permission approval
+  from your phone, pairing codes and group policy. Use it.
+- Just want your session on your phone? **Claude Code Remote Control** is
+  official and needs no setup — though it requires an Anthropic login (no API
+  key, Bedrock or custom base URL).
+- Want a polished mobile app? [Happy](https://github.com/slopus/happy).
+
+**Use this if** you are in the VS Code extension, you want Telegram **voice
+notes transcribed** and **video summarised** (no official equivalent), or you
+want a self-hosted bridge that works with any auth setup.
 
 ## Features
 
@@ -34,7 +49,6 @@ The official Claude Code Channels (Telegram plugin) only works in the CLI. This 
 - `wait_for_message` blocks until user sends anything (text, media, or button press) — optional `timeout_seconds`, clean abort handling (no zombie listeners)
 - Stop codewords: `/done`, `/stop`, `/back`, `/desk` — cleanly end the listening loop
 - `check_messages` for non-blocking queue reads
-- MCP logging notifications when messages arrive while not listening
 - Structured error results (`isError`) on every tool; file-size guards (20 MB download / 50 MB upload limits reported clearly)
 - Media downloads run in the background (v3.5) — a slow photo can no longer delay the text messages behind it
 
@@ -151,6 +165,7 @@ Send a video → Claude calls `process_video` → gets:
 | `CHAT_ID` | Yes | Your Telegram chat ID |
 | `OPENAI_API_KEY` | No | For audio transcription and video processing |
 | `DOWNLOAD_DIR` | No | Where to save media files (default: `/tmp/telegram-mcp`) |
+| `ALLOWED_USER_IDS` | No | Comma-separated Telegram user IDs allowed to drive the session. **Set this if `CHAT_ID` is a group** — otherwise every group member can. |
 
 ## How It Works
 
@@ -165,6 +180,13 @@ target is reduced to a safe basename inside `DOWNLOAD_DIR` (no directory
 components, no null bytes, length-bounded, random suffix on collision), and
 downloads use a byte-counting bounded read so a server that lies about
 `file_size` cannot write past the 20 MB limit.
+
+**Gate on identity, not just the room.** `CHAT_ID` restricts which *chat* the
+bridge listens to. In a one-to-one chat that is also an identity gate, but if
+you point `CHAT_ID` at a **group**, every member of that group can drive the
+session — and `send_file` has no sandbox. Set `ALLOWED_USER_IDS` to the user
+IDs you actually trust. The server warns on startup if `CHAT_ID` is a group and
+no allowlist is set.
 
 **If you are running a version before v3.5.0, update.** A malicious `file_name`
 could escape the download directory and overwrite arbitrary files. Details in
@@ -191,6 +213,7 @@ reload the session. Check for stray processes with `ps aux | grep telegram`.
 
 Full history in **[CHANGELOG.md](CHANGELOG.md)**.
 
+- **v3.6.2** — Security: `CHAT_ID` was a room gate, not an identity gate — if pointed at a group, any member could drive the session. Adds optional `ALLOWED_USER_IDS` (backwards compatible) plus a startup warning. Also removed a README claim that never worked (MCP logging notifications are not surfaced by Claude Code) and added honest positioning against the official alternatives.
 - **v3.6.1** — Fixed: one malformed update used to discard every queued message alongside it (the queue is drained before processing, so a throw mid-loop lost the whole batch). Plus 44/44 on transport fuzzing — hostile `message_id`s, callback floods, oversized captions and malformed updates all fail soft.
 - **v3.6.0** — The bridge can no longer die quietly. A dead poller (409 duplicate consumer, or 401 rejected token — a second silent-death vector found this round) used to return clean timeouts forever with no recovery; it now surfaces an explicit error through the tools, retries with backoff, and exits so the host can restart it. Adds pid-file single-instance with verified takeover (never signals a process it cannot positively identify), orphan self-exit, and a bound on the callback queue.
 - **v3.5.1** — Fixed a **critical** crash: a code fence with a very long language token sent `splitRaw` into an infinite loop and killed the process (taking the whole bridge down) — reachable through any content the assistant echoes. Also: `send_file` on a `.ts` file could delete a same-named received attachment; `messageQueue` is now bounded at 500 with the drop count surfaced; `process_video` frames are capped and share the 4 MB inline budget.
