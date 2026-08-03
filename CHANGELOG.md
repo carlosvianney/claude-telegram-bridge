@@ -4,6 +4,53 @@ All notable changes to this project are documented here.
 
 ---
 
+## v3.6.1 — One bad message no longer destroys the batch
+
+### Fixed — a malformed update discarded every queued message with it
+
+`check_messages` drains the queue with `messageQueue.splice(0)` *before*
+processing it. The stop-word check then called `msg.text.trim()`, assuming
+`text` is a string. A non-string `text` threw mid-loop — and because the queue
+had already been emptied, every message in that batch was gone, including the
+ones already formatted successfully.
+
+```
+queued:  good-1, good-2, good-3, <text:4242>, good-4
+before:  isError "msg.text.trim is not a function"; second call [] — all 5 lost
+after:   all 5 returned, the malformed one passed through harmlessly
+```
+
+Two changes: a type-safe `isStopWord()` used by both `wait_for_message` and
+`check_messages`, and per-message isolation in the drain loop so one bad entry
+is skipped and reported rather than aborting the batch.
+
+Reachability is limited — real Telegram always sends `text` as a string, so
+this needs a malformed or proxied update — but the failure was total and
+silent for the whole batch.
+
+### Fixed — `edit_message` with `message_id: 0`
+
+`message_id || lastSentMessageId` treated `0` as absent and edited the last
+sent message instead. Now uses `??`. Cosmetic in practice, since `0` is never
+a valid Telegram message id.
+
+### Verified this round
+
+44/44 on transport fuzzing: hostile `message_id` values (negative, zero,
+beyond 2^53, float, `1e308`) all fail soft with no token in any error string;
+no cross-chat reach, since `chat_id` is server-side only; callback flooding
+respects the new 500 bound, dropping oldest and surfacing the count; 4096-char
+captions, 100k text, missing fields and 200-deep nesting all survive. An
+uncaught throw in the now-synchronous message handler is contained by
+`bot.catch` and does **not** kill the poll loop.
+
+The `gaps.mjs` G2 assertions were rewritten — they had been asserting the
+409 bug that v3.6.0 fixed, and one was passing for the wrong reason. Now 6/6
+against the corrected expectations, including a new check that the tools
+return to normal after recovery rather than staying stuck in an error state.
+
+---
+
 ## v3.6.0 — The bridge can no longer die quietly
 
 This release closes the failure mode behind the symptom that started this

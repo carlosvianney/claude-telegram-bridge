@@ -78,7 +78,7 @@ function clearResolvers() {
 // --- MCP server (declared early so the bot handlers can log through it) ---
 
 const server = new McpServer(
-  { name: "telegram-chat-mcp", version: "3.6.0" },
+  { name: "telegram-chat-mcp", version: "3.6.1" },
   { capabilities: { logging: {} } }
 );
 
@@ -371,6 +371,11 @@ bot.on("callback_query", async (ctx) => {
 
 // --- Tools ---
 
+/** Type-safe: a malformed update can carry a non-string `text`, and calling
+ *  .trim() on it used to throw mid-drain and lose the entire batch. */
+function isStopWord(msg: IncomingMessage): boolean {
+  return msg.type === "text" && typeof msg.text === "string" && STOP_WORDS.includes(msg.text.trim().toLowerCase());
+}
 const STOP_WORDS = ["/done", "/stop", "/back", "/desk"];
 
 // TOOL: send_message
@@ -422,7 +427,7 @@ server.tool(
     buttons: z.array(z.array(z.object({ text: z.string(), data: z.string() }))).optional().describe("Updated inline keyboard buttons (omit to remove buttons)"),
   },
   async ({ message_id, text, buttons }) => {
-    const targetId = message_id || lastSentMessageId;
+    const targetId = message_id ?? lastSentMessageId; // ?? not || : 0 is a value, not "absent"
     if (!targetId) return fail("No message to edit.");
 
     const formatted = markdownToTelegramHtml(text);
@@ -552,7 +557,7 @@ server.tool(
           messageQueue.unshift(msg);
           return ok({ aborted: true });
         }
-        if (msg.type === "text" && STOP_WORDS.includes(msg.text.trim().toLowerCase())) {
+        if (isStopWord(msg)) {
           return ok({ stop: true, codeword: msg.text.trim() });
         }
         return { content: formatReturnContent(msg) };
@@ -580,11 +585,17 @@ server.tool(
         results.push({ ...formatMessage(raw), fileStatus: "downloading" });
         continue;
       }
-      const msg = await settled(raw); // instant: already settled (or non-media)
-      if (msg.type === "text" && STOP_WORDS.includes(msg.text.trim().toLowerCase())) {
-        return ok({ stop: true, codeword: msg.text.trim(), pending: results });
+      // Per-message isolation: one malformed entry must never discard the
+      // batch that was already drained out of the queue.
+      try {
+        const msg = await settled(raw); // instant: already settled (or non-media)
+        if (isStopWord(msg)) {
+          return ok({ stop: true, codeword: msg.text.trim(), pending: results });
+        }
+        results.push(formatMessage(msg));
+      } catch (err) {
+        results.push({ error: `Skipped an unreadable message: ${err instanceof Error ? err.message : String(err)}` });
       }
-      results.push(formatMessage(msg));
     }
     for (const cb of callbacks) {
       results.push({ button_data: cb.data, from: cb.from, message_id: cb.messageId });
@@ -861,7 +872,7 @@ async function runPolling(): Promise<void> {
         onStart: () => {
           pollingState = "running";
           pollingError = "";
-          process.stderr.write("[telegram-mcp] polling started (v3.6.0, grammY)\n");
+          process.stderr.write("[telegram-mcp] polling started (v3.6.1, grammY)\n");
         },
       });
       return; // resolved only via bot.stop()
