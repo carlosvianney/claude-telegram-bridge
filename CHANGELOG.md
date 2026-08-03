@@ -4,6 +4,83 @@ All notable changes to this project are documented here.
 
 ---
 
+## v3.5.1 — Formatter crash fix + resource bounds
+
+Found by a second adversarial pass over the code paths v3.5.0 did not touch.
+
+### Fixed — a code fence could kill the whole bridge (critical)
+
+**Symptom.** The MCP process dies with `FATAL ERROR: Reached heap limit —
+JavaScript heap out of memory`, or hangs forever pinning a core. When the
+process dies the poll loop dies with it: the bridge goes down entirely.
+
+**Cause.** `splitRaw()` in `format.ts` did not terminate for a non-positive
+budget. A fenced code block whose *language token* is very long
+(` ```aaaa…4000 chars ` ) drove the per-chunk budget negative via the
+`class="language-…"` attribute. With a negative budget `lastIndexOf` returns
+`-1`, so `rest = rest.slice(-1)` never shrank and the output array grew until
+the heap died.
+
+**Why it mattered.** This ran on **outgoing** text, from both `send_message`
+and `edit_message`. Neither an infinite loop nor an OOM is catchable, and the
+call sits outside `send_message`'s `try` block regardless. Any content the
+assistant echoes could carry the payload — relayed file contents, a quoted
+message, scraped text — so it was reachable without the operator ever typing
+it.
+
+**Fix.** Two changes, no timers:
+
+- `splitRaw()` clamps its budget to a floor (`Math.max(16, …)`), making the
+  function total for every possible input.
+- The fence's language token is clamped to 20 characters at the source, so it
+  can no longer consume the chunk budget.
+
+Verified against the exact repro cases — 4100-char, 3960-char, 4200-char and
+100 000-char language tokens all now return in ~1 ms. All other formatter
+output is byte-identical.
+
+Present since v3.4.0.
+
+### Fixed — `send_file` on a `.ts` file could delete a received attachment
+
+Sending a `.ts` file copies it to `<basename>.txt` inside `DOWNLOAD_DIR`,
+sends it, then deletes the copy. If a received attachment already had that
+name, it was overwritten and then removed — a file you were sent could vanish
+before you read it.
+
+The temp name now goes through `safeTargetName()`, which adds a collision
+suffix.
+
+### Added — bound on the message queue
+
+`messageQueue` was unbounded. A flood or a long unattended session grew memory
+until the process died; 4000 queued messages measured ~11 MB of text and a
+40 MB RSS increase, returned in a single `check_messages` response.
+
+Now capped at 500, dropping oldest first, with the dropped count surfaced in
+`check_messages` so the loss is never silent. A constant bound, not a timer.
+
+### Added — cumulative frame budget for `process_video`
+
+`maxFrames` had no upper bound and the 4 MB inline-image ceiling was not
+applied to extracted keyframes. A perfectly ordinary 13 MB video produced 300
+frames and an 11.3 MB response.
+
+Frames are now capped at 20 per call, and inlining stops at the same 4 MB
+ceiling single images already respect, reporting how many frames were omitted.
+
+### Also verified clean in this pass
+
+No ReDoS anywhere in the formatter (200k-character adversarial inputs complete
+in ≤10 ms). No HTML injection — script tags, event handlers and pre-escaped
+entities are all escaped exactly once. NUL-sentinel forgery is blocked. Chunk
+boundaries never split a tag or an entity. `execFileSync` argument handling is
+injection-proof, including a file literally named `-i`. The ffmpeg cleanup
+sandbox holds. `MAX_UPLOAD_BYTES` correctly uses real on-disk size. No token
+leakage in any output or error path.
+
+---
+
 ## v3.5.0 — Message delivery reliability + security hardening
 
 Two independent problems, found while diagnosing a real symptom: messages

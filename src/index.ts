@@ -58,6 +58,13 @@ interface CallbackData { id: string; data: string; from: string; messageId: numb
 
 const messageQueue: IncomingMessage[] = [];
 const callbackQueue: CallbackData[] = [];
+/**
+ * Hard bound on unread messages. Without it the queue grows until the process
+ * dies — a long unattended session or a flood is enough. Oldest are dropped
+ * first and the count is surfaced, so the loss is never silent.
+ */
+const MAX_QUEUED = 500;
+let droppedCount = 0;
 let callbackResolver: ((cb: CallbackData) => void) | null = null;
 let waitingResolver: ((msg: IncomingMessage) => void) | null = null;
 let mcpReady = false;
@@ -71,7 +78,7 @@ function clearResolvers() {
 // --- MCP server (declared early so the bot handlers can log through it) ---
 
 const server = new McpServer(
-  { name: "telegram-chat-mcp", version: "3.5.0" },
+  { name: "telegram-chat-mcp", version: "3.5.1" },
   { capabilities: { logging: {} } }
 );
 
@@ -333,6 +340,10 @@ bot.on("message", (ctx) => {
     // (first settled message wins; late settlers are re-queued by the waiter).
     waitingResolver(incoming);
   } else {
+    if (messageQueue.length >= MAX_QUEUED) {
+      messageQueue.shift();
+      droppedCount++;
+    }
     messageQueue.push(incoming);
     const preview = incoming.type === "text"
       ? incoming.text.slice(0, 100)
@@ -570,6 +581,11 @@ server.tool(
     for (const cb of callbacks) {
       results.push({ button_data: cb.data, from: cb.from, message_id: cb.messageId });
     }
+    // Never lose messages silently: report anything the queue bound discarded.
+    if (droppedCount > 0) {
+      results.push({ warning: `${droppedCount} older message(s) dropped — queue limit of ${MAX_QUEUED} reached.` });
+      droppedCount = 0;
+    }
     return ok(results);
   }
 );
@@ -592,7 +608,9 @@ server.tool(
     try {
       // Handle confusing extensions (.ts = TypeScript but Telegram thinks MPEG Transport Stream)
       if (CONFUSING_EXTS.includes(ext)) {
-        const safeName = path.basename(filePath).replace(/\.ts$/i, ".txt");
+        // safeTargetName adds a collision suffix, so this temp copy can never
+        // overwrite — and then delete — a received attachment of the same name.
+        const safeName = safeTargetName(path.basename(filePath).replace(/\.ts$/i, ".txt"));
         const tmpPath = path.join(DOWNLOAD_DIR, safeName);
         fs.copyFileSync(filePath, tmpPath);
         await bot.api.sendDocument(chatId, new InputFile(tmpPath), { caption: caption ? `${caption} (renamed .ts → .txt)` : `${path.basename(filePath)} (renamed .ts → .txt)` });
@@ -675,7 +693,9 @@ server.tool(
     if (!fs.existsSync(filePath)) return fail(`File not found: ${filePath}`);
 
     const doFrames = extractFrames !== false;
-    const frameLimit = maxFrames || 10;
+    // Hard-capped: an ordinary long video yields duration/2 frames, which
+    // without a ceiling pushes tens of MB of base64 through one response.
+    const frameLimit = Math.min(Math.max(1, maxFrames || 10), 20);
     const results: Record<string, unknown> = { sourceFile: filePath };
     let audioPath: string | null = null;
     let framesDir: string | null = null;
@@ -711,11 +731,21 @@ server.tool(
         const frameFiles = fs.readdirSync(framesDir).sort().filter(f => f.endsWith(".jpg"));
         results.keyframeCount = frameFiles.length;
 
+        // Cumulative budget: the same ceiling single images already respect,
+        // applied across all frames so the response cannot grow without bound.
+        let inlinedBytes = 0;
+        let omitted = 0;
         for (const file of frameFiles) {
           try {
             const imgData = fs.readFileSync(path.join(framesDir, file));
+            if (inlinedBytes + imgData.length > MAX_INLINE_IMAGE_BYTES) { omitted++; continue; }
+            inlinedBytes += imgData.length;
             content.push({ type: "image", data: imgData.toString("base64"), mimeType: "image/jpeg" });
           } catch {}
+        }
+        if (omitted > 0) {
+          results.keyframesOmitted = omitted;
+          results.keyframesOmittedReason = `Inline image budget of ${MAX_INLINE_IMAGE_BYTES / 1048576} MB reached — request fewer frames with maxFrames to see the rest.`;
         }
       } catch (err) {
         results.keyframeError = err instanceof Error ? err.message : String(err);
@@ -744,7 +774,7 @@ async function main() {
   // tools then return errors, and the failure is visible instead of fatal.
   bot.start({
     allowed_updates: ["message", "callback_query"],
-    onStart: () => { process.stderr.write("[telegram-mcp] polling started (v3.5.0, grammY)\n"); },
+    onStart: () => { process.stderr.write("[telegram-mcp] polling started (v3.5.1, grammY)\n"); },
   }).catch((err) => {
     log("error", `Telegram polling failed to start: ${err instanceof Error ? err.message : String(err)}`);
   });

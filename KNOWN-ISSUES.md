@@ -147,7 +147,30 @@ never observable).
 
 ---
 
-## 7. Running this alongside the official plugin is confusing
+## 7. `send_file` is an unsandboxed read primitive
+
+**Severity: design risk, not a bug. Unchanged by design.**
+
+`send_file` will send any path the caller gives it, and it follows symlinks.
+That is intended — it is an operator-controlled tool on the operator's own
+machine, and restricting it would break ordinary use.
+
+The risk worth naming: **a single prompt-injected `send_file` call exfiltrates
+whatever it names.** A hostile message that persuades the assistant to send
+`.mcp.json`, an `.env`, or a key file puts those credentials in a Telegram
+chat. Nothing in the code prevents this, because nothing in the code can tell
+an intended send from a manipulated one.
+
+Mitigation is a policy decision rather than a code change — a denylist of
+credential-shaped paths (`.env`, `.mcp.json`, `id_*`, `*.pem`) would cover the
+obvious cases without meaningfully restricting normal use. Not implemented;
+flagged so the risk is at least explicit.
+
+Applies to any MCP server with filesystem reach, not only this one.
+
+---
+
+## 8. Running this alongside the official plugin is confusing
 
 **Severity: operational, not a code bug.**
 
@@ -164,7 +187,7 @@ inside an existing session.
 
 ---
 
-## 8. Structural limits (not bugs)
+## 9. Structural limits (not bugs)
 
 - **One chat only** — `CHAT_ID` locks the server to a single conversation.
 - **No cold activation** — the server cannot start a turn on its own. It only
