@@ -4,6 +4,67 @@ All notable changes to this project are documented here.
 
 ---
 
+## v3.7.1 — Durable log, media descriptions, burst coalescing
+
+Everything here came out of the first hour of real use after v3.7.0 shipped.
+
+### Added — `media_note`: keep what a photo showed, not the photo
+
+Media was the only thing left that grew without bound. At ~143 KB a photo and
+20 photos a day that is **~1 GB/year**; a description line is ~200 bytes —
+roughly **750× smaller**. `media_note` appends a description of a received image
+to the feed and optionally deletes the file, so the record stays permanent and
+searchable while the bytes go away. Entries are marked `untrusted: false` —
+they are authored by the assistant, not the sender.
+
+Paired with dropping the default media retention from 7 days to 2 in practice
+(`RETAIN_DOWNLOAD_DAYS`), since the description now carries the memory.
+
+### Added — `FEED_PATH`, so the log can outlive `/tmp`
+
+The feed defaulted to `${DOWNLOAD_DIR}/incoming.jsonl`, which on most Linux
+systems is cleared at reboot. `FEED_PATH` separates the two concerns: media
+stays scratch and gets reaped, while the log lives somewhere durable.
+
+This matters more than it looks. **Telegram's Bot API exposes no history and no
+search** — this file is the only record of the conversation that exists anywhere.
+
+### Added — `contrib/watch-feed.sh`: burst coalescing and no self-echo
+
+Two problems, both found in live use, neither caught by any test round:
+
+**1. A burst became N wakeups.** Raw `tail -F` emits one line per message, and
+each arrival cancels the turn the previous one started — so rapid messages
+produced nothing at all. Measured live before the fix: 8 messages in 4 seconds
+produced four consecutive interrupted turns and 1 m 51 s of silence.
+
+The script buffers until the sender pauses (3 s default), then emits the burst
+at once. Measured live after: **8 messages in 3.99 s → one event, all present,
+in order, none lost.** Messages 5.6 s apart still arrive separately, so it
+groups a burst without lumping a conversation together.
+
+**2. The feed echoed my own writes back at me.** `media_note` appends to the
+same file the watcher tails, so writing a description notified the assistant
+about its own write — a feedback loop. The watcher now emits only
+`"untrusted":true` lines. Verified: 2/2 sender messages through, 0 self-echoes.
+
+### Measured live, end to end
+
+| | Before today | After |
+|---|---|---|
+| Delivery | **0 of ~87 polls** | **17 of 17** |
+| Latency | 60 s floor; 20–30 min observed | **359–1,227 ms** |
+| Rapid-fire | turns cancelled, nothing completed | one coalesced event |
+| Editor keyboard | blocked | free |
+| Conversation log | none | durable, survives reboot |
+| Media growth | ~1 GB/year | ~1.4 MB/year of descriptions |
+
+A fully idle session **is** woken — the open question from v3.7.0, now answered
+by observation rather than inference. Concurrent desk + phone input during an
+active turn also completed cleanly, verified from the owner's own screenshot.
+
+---
+
 ## v3.7.0 — Credential guard, and messages that arrive without blocking
 
 Two features, both pen-tested before shipping. 49 new checks, 0 failures.

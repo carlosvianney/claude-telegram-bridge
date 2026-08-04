@@ -96,7 +96,7 @@ function clearResolvers() {
 // --- MCP server (declared early so the bot handlers can log through it) ---
 
 const server = new McpServer(
-  { name: "telegram-chat-mcp", version: "3.7.0" },
+  { name: "telegram-chat-mcp", version: "3.7.1" },
   { capabilities: { logging: {} } }
 );
 
@@ -356,7 +356,12 @@ function formatReturnContent(msg: IncomingMessage): ToolContent {
  * Claude Code: the Monitor tool with `persistent: true`). Additive —
  * wait_for_message is untouched for clients without a file watcher.
  */
-const FEED_PATH = path.join(DOWNLOAD_DIR, "incoming.jsonl");
+/**
+ * The feed is a durable record; DOWNLOAD_DIR is scratch. Keep them separable so
+ * media can live in /tmp and be reaped while the log survives reboots.
+ * Telegram's Bot API exposes no history, so this file is the only record there is.
+ */
+const FEED_PATH = process.env.FEED_PATH || path.join(DOWNLOAD_DIR, "incoming.jsonl");
 /** Rotate at 5 MB, keeping one previous generation: bounded at ~10 MB total. */
 const FEED_MAX_BYTES = 5 * 1024 * 1024;
 let feedEnabled = false;
@@ -972,6 +977,52 @@ server.tool(
   }
 );
 
+/**
+ * Append a description of received media to the feed so the file itself need not
+ * be kept. Media is the only thing here that grows without bound: ~143 KB per
+ * photo is ~1 GB/year at 20/day, against ~200 bytes for a description — roughly
+ * 750x smaller. Recording what a photo SHOWED lets the image be reaped on a
+ * short clock while the record stays permanent and searchable.
+ */
+server.registerTool(
+  "media_note",
+  {
+    title: "Describe received media for the permanent log",
+    description:
+      "Append a text description of a received photo/video to the incoming feed, so the media file can be deleted without losing the record. Call after viewing an image that arrived over Telegram.",
+    inputSchema: {
+      description: z.string().min(1).describe("What the media shows, in plain text. This replaces the file in the permanent record."),
+      filePath: z.string().optional().describe("Path of the media file this describes (as delivered in the feed event)."),
+      deleteFile: z.boolean().optional().describe("Delete the media file now that it is described (default false; only files inside the download dir are ever removed)."),
+    },
+  },
+  async ({ description, filePath, deleteFile }) => {
+    const entry: Record<string, unknown> = {
+      event: "media_note",
+      untrusted: false, // authored by the assistant, not the sender
+      received_at: new Date().toISOString(),
+      description,
+    };
+    let deleted = false;
+    if (filePath) {
+      entry.filePath = filePath;
+      try { entry.fileSize = fs.statSync(filePath).size; } catch {}
+      if (deleteFile && isInDownloadDir(filePath)) {
+        try { fs.unlinkSync(filePath); deleted = true; } catch {}
+      }
+    }
+    entry.fileDeleted = deleted;
+    try {
+      rotateFeedIfNeeded();
+      fs.mkdirSync(path.dirname(FEED_PATH), { recursive: true });
+      fs.appendFileSync(FEED_PATH, JSON.stringify(entry) + "\n");
+    } catch (err) {
+      return fail(`Could not write media note: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return ok({ logged: true, feedPath: FEED_PATH, fileDeleted: deleted });
+  }
+);
+
 // --- Single-instance lifecycle ---
 
 /**
@@ -1070,7 +1121,7 @@ async function runPolling(): Promise<void> {
         onStart: () => {
           pollingState = "running";
           pollingError = "";
-          process.stderr.write("[telegram-mcp] polling started (v3.7.0, grammY)\n");
+          process.stderr.write("[telegram-mcp] polling started (v3.7.1, grammY)\n");
         },
       });
       return; // resolved only via bot.stop()

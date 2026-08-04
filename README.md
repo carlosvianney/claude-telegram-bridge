@@ -63,6 +63,7 @@ want a self-hosted bridge that works with any auth setup.
 | `send_file` | Send a file (auto-detects photo/video/document; refuses credential-shaped paths) |
 | `incoming_feed` | Stream incoming messages to a JSONL file instead of blocking on `wait_for_message` |
 | `react` | Add emoji reaction to a message |
+| `media_note` | Describe received media so the file can be deleted without losing the record |
 | `transcribe_audio` | Transcribe audio/voice via Whisper *(optional)* |
 | `process_video` | Extract transcript + keyframes from video *(optional)* |
 
@@ -168,6 +169,7 @@ Send a video → Claude calls `process_video` → gets:
 | `DOWNLOAD_DIR` | No | Where to save media files (default: `/tmp/telegram-mcp`) |
 | `SEND_FILE_DENY` | No | Comma-separated glob patterns `send_file` refuses (defaults cover `.env`, `.mcp.json`, SSH keys, `*.pem`, `secrets*`, `credentials*`) |
 | `RETAIN_DOWNLOAD_DAYS` | No | Delete received media older than this many days, once at startup (default `7`, `0` disables) |
+| `FEED_PATH` | No | Where the incoming feed is written (default `$DOWNLOAD_DIR/incoming.jsonl`). Point it outside `/tmp` to keep history across reboots. |
 | `ALLOWED_USER_IDS` | No | Comma-separated Telegram user IDs allowed to drive the session. **Set this if `CHAT_ID` is a group** — otherwise every group member can. |
 
 ## How It Works
